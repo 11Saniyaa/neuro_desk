@@ -188,7 +188,7 @@ async def analyze_frame(request: AnalyzeRequest):
         if not image_data:
             logging.warning("No image data provided")
             return JSONResponse(
-                status_code=400,
+                status_code=200,
                 content={
                     "error": "No image data provided",
                     "timestamp": datetime.now().isoformat(),
@@ -210,7 +210,7 @@ async def analyze_frame(request: AnalyzeRequest):
         except Exception as decode_err:
             logging.error(f"Error decoding image: {decode_err}", exc_info=True)
             return JSONResponse(
-                status_code=400,
+                status_code=200,
                 content={
                     "error": f"Image decode error: {str(decode_err)}",
                     "timestamp": datetime.now().isoformat(),
@@ -262,7 +262,9 @@ async def analyze_frame(request: AnalyzeRequest):
             }
             
             logging.info(f"Analysis complete, productivity score: {productivity.get('productivity_score', 'N/A')}")
-            return response
+            logging.info(f"Response structure: {list(response.keys())}")
+            logging.info(f"Sending response with {len(response.get('recommendations', []))} recommendations")
+            return JSONResponse(content=response, status_code=200)
         except Exception as analysis_err:
             logging.error(f"Error in analysis: {analysis_err}", exc_info=True)
             raise
@@ -273,7 +275,7 @@ async def analyze_frame(request: AnalyzeRequest):
         error_trace = traceback.format_exc()
         logging.error(f"Full traceback: {error_trace}")
         return JSONResponse(
-            status_code=500,
+            status_code=200,
             content={
                 "error": str(e),
                 "timestamp": datetime.now().isoformat(),
