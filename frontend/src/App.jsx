@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
 
 function App() {
@@ -12,10 +12,20 @@ function App() {
   const wsRef = useRef(null)
   const streamRef = useRef(null)
   const animationFrameRef = useRef(null)
+  const reconnectTimeoutRef = useRef(null)
+  const isConnectedRef = useRef(false) // Use ref to avoid stale closures
+  const connectWebSocketRef = useRef(null) // Ref to store connectWebSocket function
+
+  useEffect(() => {
+    isConnectedRef.current = isConnected
+  }, [isConnected])
 
   useEffect(() => {
     return () => {
       // Cleanup
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+      }
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop())
       }
@@ -27,6 +37,192 @@ function App() {
       }
     }
   }, [])
+
+  // Function to stop sending frames
+  const stopSendingFrames = useCallback(() => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current)
+      animationFrameRef.current = null
+    }
+  }, [])
+
+  // Function to send frames
+  const startSendingFrames = useCallback(() => {
+    const sendFrame = () => {
+      if (!videoRef.current || !canvasRef.current) {
+        animationFrameRef.current = requestAnimationFrame(sendFrame)
+        return
+      }
+
+      // Check WebSocket state
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        // If WebSocket is not open, stop sending frames
+        stopSendingFrames()
+        setIsAnalyzing(false)
+        // Reconnection logic is handled in ws.onclose
+        return
+      }
+
+      try {
+        const video = videoRef.current
+        const canvas = canvasRef.current
+        const ctx = canvas.getContext('2d')
+
+        // Check if video is ready
+        if (video.readyState !== video.HAVE_ENOUGH_DATA) {
+          animationFrameRef.current = requestAnimationFrame(sendFrame)
+          return
+        }
+
+        canvas.width = video.videoWidth || 640
+        canvas.height = video.videoHeight || 480
+        ctx.drawImage(video, 0, 0)
+
+        const imageData = canvas.toDataURL('image/jpeg', 0.8)
+        
+        wsRef.current.send(JSON.stringify({
+          image: imageData
+        }))
+
+        animationFrameRef.current = requestAnimationFrame(sendFrame)
+      } catch (err) {
+        console.error('❌ Error sending frame:', err)
+        setError('Failed to send video frame. Connection may be broken.')
+        setIsAnalyzing(false)
+        stopSendingFrames()
+        // Don't reconnect here - let onclose handle it
+      }
+    }
+
+    stopSendingFrames() // Ensure no duplicate loops
+    animationFrameRef.current = requestAnimationFrame(sendFrame)
+  }, [stopSendingFrames]) // Dependencies for useCallback
+
+  // Function to connect WebSocket
+  const connectWebSocket = useCallback(() => {
+    // Clear any existing reconnection timeout
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current)
+      reconnectTimeoutRef.current = null
+    }
+
+    try {
+      console.log('🔌 Attempting to connect to WebSocket at ws://localhost:8000/ws...')
+      
+      // Close existing connection if any
+      if (wsRef.current) {
+        try {
+          wsRef.current.close(1000, 'New connection attempt') // Clean close
+        } catch (e) {
+          console.log('Error closing existing connection:', e)
+        }
+      }
+      
+      const ws = new WebSocket('ws://localhost:8000/ws')
+      wsRef.current = ws
+      console.log('WebSocket object created, readyState:', ws.readyState)
+
+      // Connection timeout - if not connected in 5 seconds, show error
+      const connectionTimeout = setTimeout(() => {
+        if (ws.readyState === WebSocket.CONNECTING) {
+          console.error('❌ WebSocket connection timeout after 5 seconds')
+          ws.close(1000, 'Connection timeout') // Clean close with reason
+          setError('Connection timeout. Make sure backend is running on port 8000.')
+          setIsAnalyzing(false)
+        }
+      }, 5000)
+
+      ws.onopen = () => {
+        clearTimeout(connectionTimeout)
+        console.log('✅ WebSocket connected successfully!')
+        console.log('WebSocket readyState:', ws.readyState)
+        console.log('WebSocket URL:', ws.url)
+        setIsAnalyzing(true)
+        setError(null)
+        console.log('Starting to send frames...')
+        // Small delay before starting to send frames to ensure connection is stable
+        setTimeout(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            startSendingFrames()
+          } else {
+            console.warn('WebSocket not open when trying to start sending frames')
+          }
+        }, 100)
+      }
+
+      ws.onmessage = (event) => {
+        try {
+          const response = JSON.parse(event.data)
+          setData(response)
+          setIsAnalyzing(true) // Keep analyzing if we're receiving data
+          setError(null) // Clear any previous errors
+          console.log('✅ Received analysis data')
+        } catch (err) {
+          console.error('Error parsing WebSocket message:', err)
+          setError('Error processing server response')
+        }
+      }
+
+      ws.onerror = (err) => {
+        clearTimeout(connectionTimeout)
+        console.error('❌ WebSocket error:', err)
+        console.error('WebSocket state:', ws.readyState)
+        console.error('WebSocket URL:', ws.url)
+        setIsAnalyzing(false)
+        setError('WebSocket connection error. Check: 1) Backend running on port 8000, 2) No firewall blocking, 3) Open http://localhost:8000/health in browser')
+        stopSendingFrames()
+      }
+
+      ws.onclose = (event) => {
+        clearTimeout(connectionTimeout)
+        console.log('🔌 WebSocket disconnected. Code:', event.code, 'Reason:', event.reason || 'No reason provided')
+        console.log('Was clean close:', event.wasClean)
+        setIsAnalyzing(false)
+        stopSendingFrames()
+        
+        // Provide helpful error messages based on close code
+        if (event.code === 1006) {
+          console.error('❌ Connection closed abnormally (1006) - backend may not be running or connection refused')
+          setError('Connection failed. Backend may not be running. Check: http://localhost:8000/health')
+        } else if (event.code === 1002) {
+          console.error('❌ Protocol error (1002)')
+          setError('Protocol error. Check backend WebSocket implementation.')
+        } else if (event.code === 1003) {
+          console.error('❌ Unsupported data (1003)')
+          setError('Unsupported data format.')
+        } else if (event.code !== 1000 && event.code !== 1001) {
+          console.error('❌ Unexpected close code:', event.code)
+          setError(`Connection closed with code ${event.code}. Check backend logs.`)
+        }
+        
+        // Attempt to reconnect if the app is still "connected" (camera is on)
+        // and the close was not a normal or explicit user-initiated close
+        if (isConnectedRef.current && videoRef.current && event.code !== 1000 && event.code !== 1001) {
+          console.log('🔄 Unexpected disconnect. Attempting to reconnect in 2 seconds...')
+          reconnectTimeoutRef.current = setTimeout(() => {
+            if (isConnectedRef.current && videoRef.current && (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED)) {
+              console.log('🔄 Reconnecting WebSocket...')
+              if (connectWebSocketRef.current) {
+                connectWebSocketRef.current()
+              }
+            }
+          }, 2000)
+        } else if (event.code === 1000) {
+          console.log('WebSocket closed normally')
+        }
+      }
+    } catch (err) {
+      console.error('Error creating WebSocket:', err)
+      setError('Failed to create WebSocket connection. Check console for details.')
+      setIsAnalyzing(false)
+      stopSendingFrames()
+    }
+  }, [startSendingFrames, stopSendingFrames]) // Dependencies for useCallback
+
+  // Store connectWebSocket in ref so it can be called from other callbacks
+  useEffect(() => {
+    connectWebSocketRef.current = connectWebSocket
+  }, [connectWebSocket])
 
   const startCamera = async () => {
     try {
@@ -57,209 +253,40 @@ function App() {
       }
       
       setIsConnected(true)
-      // Small delay to ensure video is fully ready
+      // Small delay to ensure video is fully ready and rendered before connecting WebSocket
       setTimeout(() => {
-        connectWebSocket()
-      }, 500)
+        if (connectWebSocketRef.current) {
+          connectWebSocketRef.current()
+        } else {
+          connectWebSocket()
+        }
+      }, 500) // 500ms delay
     } catch (err) {
       setError('Camera access denied. Please allow camera permissions.')
       console.error('Camera error:', err)
-    }
-  }
-
-  const connectWebSocket = () => {
-    let connectionTimeout = null
-    
-    try {
-      console.log('Attempting to connect to WebSocket at ws://localhost:8000/ws...')
-      
-      // Close existing connection if any
-      if (wsRef.current) {
-        try {
-          wsRef.current.close()
-        } catch (e) {
-          console.log('Error closing existing connection:', e)
-        }
-      }
-      
-      const ws = new WebSocket('ws://localhost:8000/ws')
-      wsRef.current = ws
-
-      // Connection timeout - if not connected in 5 seconds, show error
-      connectionTimeout = setTimeout(() => {
-        if (ws.readyState === WebSocket.CONNECTING) {
-          console.error('❌ WebSocket connection timeout after 5 seconds')
-          ws.close()
-          setError('Connection timeout. Make sure backend is running on port 8000.')
-          setIsAnalyzing(false)
-        }
-      }, 5000)
-
-      ws.onopen = () => {
-        clearTimeout(connectionTimeout)
-        console.log('✅ WebSocket connected successfully!')
-        console.log('WebSocket readyState:', ws.readyState)
-        setIsAnalyzing(true)
-        setError(null)
-        console.log('Starting to send frames...')
-        startSendingFrames()
-      }
-
-      ws.onmessage = (event) => {
-        try {
-          const response = JSON.parse(event.data)
-          setData(response)
-          setIsAnalyzing(true) // Keep analyzing if we're receiving data
-          setError(null) // Clear any previous errors
-        } catch (err) {
-          console.error('Error parsing WebSocket message:', err)
-          setError('Error processing server response')
-        }
-      }
-
-      ws.onerror = (err) => {
-        clearTimeout(connectionTimeout)
-        console.error('❌ WebSocket error:', err)
-        console.error('WebSocket state:', ws.readyState)
-        console.error('WebSocket URL:', ws.url)
-        console.error('Error details:', err)
-        setIsAnalyzing(false)
-        setError('WebSocket connection error. Check: 1) Backend running on port 8000, 2) No firewall blocking, 3) Open http://localhost:8000/health in browser')
-      }
-
-      ws.onclose = (event) => {
-        clearTimeout(connectionTimeout)
-        console.log('WebSocket disconnected. Code:', event.code, 'Reason:', event.reason || 'No reason provided')
-        console.log('Was clean close:', event.wasClean)
-        setIsAnalyzing(false)
-        
-        // Provide helpful error messages based on close code
-        if (event.code === 1006) {
-          console.error('❌ Connection closed abnormally (1006) - backend may not be running or connection refused')
-          setError('Connection failed. Backend may not be running. Check: http://localhost:8000/health')
-        } else if (event.code === 1002) {
-          console.error('❌ Protocol error (1002)')
-          setError('Protocol error. Check backend WebSocket implementation.')
-        } else if (event.code === 1003) {
-          console.error('❌ Unsupported data (1003)')
-          setError('Unsupported data format.')
-        } else if (event.code !== 1000 && event.code !== 1001) {
-          console.error('❌ Unexpected close code:', event.code)
-          setError(`Connection closed with code ${event.code}. Check backend logs.`)
-        }
-        
-        // Always try to reconnect if camera is still connected (unless user stopped it)
-        if (isConnected && videoRef.current) {
-          console.log('Attempting to reconnect in 2 seconds...')
-          setTimeout(() => {
-            if (isConnected && videoRef.current && (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED)) {
-              console.log('🔄 Reconnecting WebSocket...')
-              connectWebSocket()
-            }
-          }, 2000)
-        } else if (event.code === 1000) {
-          console.log('WebSocket closed normally (user stopped)')
-        }
-      }
-    } catch (err) {
-      console.error('Error creating WebSocket:', err)
-      setError('Failed to create WebSocket connection. Check console for details.')
+      setIsConnected(false)
       setIsAnalyzing(false)
     }
   }
 
-  const startSendingFrames = () => {
-    const sendFrame = () => {
-      if (!videoRef.current || !canvasRef.current) {
-        animationFrameRef.current = requestAnimationFrame(sendFrame)
-        return
-      }
-
-      // Check WebSocket state
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        // WebSocket not ready, try again in a bit
-        if (wsRef.current && wsRef.current.readyState === WebSocket.CONNECTING) {
-          animationFrameRef.current = requestAnimationFrame(sendFrame)
-          return
-        }
-        // WebSocket closed - try to reconnect
-        if (wsRef.current && wsRef.current.readyState === WebSocket.CLOSED && isConnected) {
-          console.log('WebSocket closed during frame sending, attempting reconnect...')
-          setIsAnalyzing(false)
-          setTimeout(() => {
-            if (isConnected && videoRef.current) {
-              connectWebSocket()
-            }
-          }, 1000)
-          return
-        }
-        // WebSocket closing or other state
-        setIsAnalyzing(false)
-        return
-      }
-
-      try {
-        const video = videoRef.current
-        const canvas = canvasRef.current
-        const ctx = canvas.getContext('2d')
-
-        // Check if video is ready
-        if (video.readyState !== video.HAVE_ENOUGH_DATA) {
-          animationFrameRef.current = requestAnimationFrame(sendFrame)
-          return
-        }
-
-        canvas.width = video.videoWidth || 640
-        canvas.height = video.videoHeight || 480
-        ctx.drawImage(video, 0, 0)
-
-        // Send frames at ~30 FPS for better performance
-        // requestAnimationFrame runs at ~60 FPS, so we skip every other frame
-        const imageData = canvas.toDataURL('image/jpeg', 0.7) // Slightly lower quality for speed
-        
-        try {
-          wsRef.current.send(JSON.stringify({
-            image: imageData
-          }))
-          animationFrameRef.current = requestAnimationFrame(sendFrame)
-        } catch (err) {
-          console.error('Error sending frame:', err)
-          // If send fails, connection might be broken - try to reconnect
-          if (isConnected && videoRef.current) {
-            setIsAnalyzing(false)
-            setTimeout(() => {
-              if (isConnected && videoRef.current) {
-                console.log('Reconnecting after send error...')
-                connectWebSocket()
-              }
-            }, 1000)
-          }
-        }
-      } catch (err) {
-        console.error('Error sending frame:', err)
-        setIsAnalyzing(false)
-      }
-    }
-
-    sendFrame()
-  }
-
-  const stopCamera = () => {
+  const stopCamera = useCallback(() => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop())
       streamRef.current = null
     }
     if (wsRef.current) {
-      wsRef.current.close()
-      wsRef.current = null
+      wsRef.current.close(1000, 'User stopped camera') // Clean close
     }
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current)
-    }
+    stopSendingFrames()
     setIsConnected(false)
     setIsAnalyzing(false)
     setData(null)
-  }
+    setError(null)
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current)
+      reconnectTimeoutRef.current = null
+    }
+  }, [stopSendingFrames])
 
   const getScoreColor = (score) => {
     if (score >= 80) return '#10b981'
@@ -302,7 +329,15 @@ function App() {
 
             {isConnected && (
               <div className="status-badge">
-                {isAnalyzing ? '🟢 Analyzing...' : wsRef.current?.readyState === WebSocket.CONNECTING ? '🟡 Connecting...' : '🔴 Disconnected'}
+                {(() => {
+                  if (!wsRef.current) return '🟡 Connecting...'
+                  const state = wsRef.current.readyState
+                  if (state === WebSocket.OPEN && isAnalyzing) return '🟢 Analyzing...'
+                  if (state === WebSocket.OPEN) return '🟢 Connected'
+                  if (state === WebSocket.CONNECTING) return '🟡 Connecting...'
+                  if (state === WebSocket.CLOSING) return '🟠 Closing...'
+                  return '🔴 Disconnected'
+                })()}
               </div>
             )}
           </div>
