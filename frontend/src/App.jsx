@@ -20,6 +20,21 @@ function App() {
     isConnectedRef.current = isConnected
   }, [isConnected])
 
+  // Debug: Log when data changes
+  useEffect(() => {
+    if (data) {
+      console.log('📊 Data state updated:', {
+        hasProductivity: !!data.productivity,
+        hasPosture: !!data.posture,
+        hasEyeStrain: !!data.eye_strain,
+        hasEngagement: !!data.engagement,
+        hasStress: !!data.stress,
+        hasRecommendations: !!data.recommendations,
+        productivityScore: data.productivity?.productivity_score
+      })
+    }
+  }, [data])
+
   useEffect(() => {
     return () => {
       // Cleanup
@@ -46,20 +61,19 @@ function App() {
     }
   }, [])
 
-  // Function to send frames
+  // Function to send frames using HTTP POST (more reliable than WebSocket)
   const startSendingFrames = useCallback(() => {
-    const sendFrame = () => {
+    let isSending = false
+    
+    const sendFrame = async () => {
       if (!videoRef.current || !canvasRef.current) {
         animationFrameRef.current = requestAnimationFrame(sendFrame)
         return
       }
 
-      // Check WebSocket state
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        // If WebSocket is not open, stop sending frames
-        stopSendingFrames()
-        setIsAnalyzing(false)
-        // Reconnection logic is handled in ws.onclose
+      // Skip if already sending (prevent overlapping requests)
+      if (isSending) {
+        animationFrameRef.current = requestAnimationFrame(sendFrame)
         return
       }
 
@@ -78,19 +92,68 @@ function App() {
         canvas.height = video.videoHeight || 480
         ctx.drawImage(video, 0, 0)
 
-        const imageData = canvas.toDataURL('image/jpeg', 0.8)
+        const imageData = canvas.toDataURL('image/jpeg', 0.7)
         
-        wsRef.current.send(JSON.stringify({
-          image: imageData
-        }))
-
-        animationFrameRef.current = requestAnimationFrame(sendFrame)
+        isSending = true
+        try {
+          console.log('📤 Sending frame to /analyze...')
+          // Use HTTP POST instead of WebSocket
+          // Use relative URL to go through Vite proxy (avoids CORS issues)
+          const response = await fetch('/analyze', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ image: imageData })
+          })
+          console.log('📥 Response received:', response.status, response.statusText)
+          
+          if (response.ok) {
+            const result = await response.json()
+            console.log('✅ Received analysis data via HTTP:', {
+              timestamp: result.timestamp,
+              productivity: result.productivity?.productivity_score
+            })
+            setData(result)
+            setIsAnalyzing(true)
+            setError(null)
+          } else {
+            const errorText = await response.text()
+            console.error('❌ HTTP request failed:', {
+              status: response.status,
+              statusText: response.statusText,
+              body: errorText
+            })
+            setError(`Analysis failed: ${response.status} ${response.statusText}`)
+          }
+        } catch (fetchErr) {
+          console.error('❌ Error sending frame via HTTP:', fetchErr)
+          console.error('Error details:', {
+            message: fetchErr.message,
+            name: fetchErr.name,
+            type: fetchErr.constructor.name
+          })
+          
+          // Check if it's a timeout
+          if (fetchErr.name === 'TimeoutError' || fetchErr.name === 'AbortError') {
+            setError('Request timeout. Backend may be slow or unresponsive.')
+          } else if (fetchErr.message.includes('Failed to fetch') || fetchErr.message.includes('NetworkError') || fetchErr.message.includes('ERR_CONNECTION_REFUSED')) {
+            setError('Cannot connect to backend. Make sure backend is running on http://localhost:8000')
+          } else {
+            setError(`Connection error: ${fetchErr.message}`)
+          }
+        } finally {
+          isSending = false
+          // Throttle to ~5 FPS (200ms between frames) to reduce backend load
+          setTimeout(() => {
+            animationFrameRef.current = requestAnimationFrame(sendFrame)
+          }, 200)
+        }
       } catch (err) {
-        console.error('❌ Error sending frame:', err)
-        setError('Failed to send video frame. Connection may be broken.')
+        console.error('❌ Error processing frame:', err)
+        isSending = false
         setIsAnalyzing(false)
         stopSendingFrames()
-        // Don't reconnect here - let onclose handle it
       }
     }
 
@@ -139,26 +202,33 @@ function App() {
         console.log('WebSocket URL:', ws.url)
         setIsAnalyzing(true)
         setError(null)
-        console.log('Starting to send frames...')
-        // Small delay before starting to send frames to ensure connection is stable
+        console.log('Starting to send frames via HTTP POST...')
+        // Use HTTP POST method instead of WebSocket for more reliability
         setTimeout(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            startSendingFrames()
-          } else {
-            console.warn('WebSocket not open when trying to start sending frames')
-          }
+          startSendingFrames()
         }, 100)
       }
 
       ws.onmessage = (event) => {
         try {
           const response = JSON.parse(event.data)
+          console.log('✅ Received analysis data:', {
+            timestamp: response.timestamp,
+            productivity: response.productivity?.productivity_score,
+            hasRecommendations: response.recommendations?.length > 0,
+            hasPosture: !!response.posture,
+            hasEyeStrain: !!response.eye_strain,
+            hasEngagement: !!response.engagement,
+            hasStress: !!response.stress
+          })
+          console.log('Full response:', response)
           setData(response)
           setIsAnalyzing(true) // Keep analyzing if we're receiving data
           setError(null) // Clear any previous errors
-          console.log('✅ Received analysis data')
+          console.log('✅ Data state updated, should display now')
         } catch (err) {
-          console.error('Error parsing WebSocket message:', err)
+          console.error('❌ Error parsing WebSocket message:', err)
+          console.error('Raw message:', event.data)
           setError('Error processing server response')
         }
       }
@@ -177,22 +247,33 @@ function App() {
         clearTimeout(connectionTimeout)
         console.log('🔌 WebSocket disconnected. Code:', event.code, 'Reason:', event.reason || 'No reason provided')
         console.log('Was clean close:', event.wasClean)
+        console.log('Current data state:', data ? 'Has data' : 'No data')
+        // Don't clear data on disconnect - keep showing last results
         setIsAnalyzing(false)
         stopSendingFrames()
         
         // Provide helpful error messages based on close code
         if (event.code === 1006) {
           console.error('❌ Connection closed abnormally (1006) - backend may not be running or connection refused')
-          setError('Connection failed. Backend may not be running. Check: http://localhost:8000/health')
+          // Only set error if we don't have data to show
+          if (!data) {
+            setError('Connection failed. Backend may not be running. Check: http://localhost:8000/health')
+          }
         } else if (event.code === 1002) {
           console.error('❌ Protocol error (1002)')
-          setError('Protocol error. Check backend WebSocket implementation.')
+          if (!data) {
+            setError('Protocol error. Check backend WebSocket implementation.')
+          }
         } else if (event.code === 1003) {
           console.error('❌ Unsupported data (1003)')
-          setError('Unsupported data format.')
+          if (!data) {
+            setError('Unsupported data format.')
+          }
         } else if (event.code !== 1000 && event.code !== 1001) {
           console.error('❌ Unexpected close code:', event.code)
-          setError(`Connection closed with code ${event.code}. Check backend logs.`)
+          if (!data) {
+            setError(`Connection closed with code ${event.code}. Check backend logs.`)
+          }
         }
         
         // Attempt to reconnect if the app is still "connected" (camera is on)
@@ -349,68 +430,78 @@ function App() {
           )}
         </div>
 
-        {data && (
+        {data && data.productivity && (
           <div className="metrics-section">
             <div className="productivity-card">
               <h2>📊 Productivity Score</h2>
               <div 
                 className="score-display"
-                style={{ color: getScoreColor(data.productivity.productivity_score) }}
+                style={{ color: getScoreColor(data.productivity?.productivity_score || 0) }}
               >
-                {data.productivity.productivity_score.toFixed(1)}
+                {(data.productivity?.productivity_score || 0).toFixed(1)}
               </div>
             </div>
 
             <div className="metrics-grid">
-              <div className="metric-card">
-                <h3>💺 Posture</h3>
-                <div className="metric-value" style={{ color: getScoreColor(data.posture.score) }}>
-                  {data.posture.score.toFixed(1)}
+              {data.posture && (
+                <div className="metric-card">
+                  <h3>💺 Posture</h3>
+                  <div className="metric-value" style={{ color: getScoreColor(data.posture?.score || 0) }}>
+                    {(data.posture?.score || 0).toFixed(1)}
+                  </div>
+                  <div className="metric-status">
+                    {data.posture?.slouching ? '⚠️ Slouching detected' : '✅ Good posture'}
+                  </div>
                 </div>
-                <div className="metric-status">
-                  {data.posture.slouching ? '⚠️ Slouching detected' : '✅ Good posture'}
-                </div>
-              </div>
+              )}
 
-              <div className="metric-card">
-                <h3>👁️ Eye Strain</h3>
-                <div className="metric-value" style={{ color: getScoreColor(data.eye_strain.score) }}>
-                  {data.eye_strain.score.toFixed(1)}
+              {data.eye_strain && (
+                <div className="metric-card">
+                  <h3>👁️ Eye Strain</h3>
+                  <div className="metric-value" style={{ color: getScoreColor(data.eye_strain?.score || 0) }}>
+                    {(data.eye_strain?.score || 0).toFixed(1)}
+                  </div>
+                  <div className="metric-status">
+                    Risk: {(data.eye_strain?.eye_strain_risk || 'low').toUpperCase()}
+                  </div>
                 </div>
-                <div className="metric-status">
-                  Risk: {data.eye_strain.eye_strain_risk.toUpperCase()}
-                </div>
-              </div>
+              )}
 
-              <div className="metric-card">
-                <h3>🧠 Engagement</h3>
-                <div className="metric-value" style={{ color: getScoreColor(data.engagement.score) }}>
-                  {data.engagement.score.toFixed(1)}
+              {data.engagement && (
+                <div className="metric-card">
+                  <h3>🧠 Engagement</h3>
+                  <div className="metric-value" style={{ color: getScoreColor(data.engagement?.score || 0) }}>
+                    {(data.engagement?.score || 0).toFixed(1)}
+                  </div>
+                  <div className="metric-status">
+                    Concentration: {(data.engagement?.concentration || 'low').toUpperCase()}
+                  </div>
                 </div>
-                <div className="metric-status">
-                  Concentration: {data.engagement.concentration.toUpperCase()}
-                </div>
-              </div>
+              )}
 
-              <div className="metric-card">
-                <h3>😌 Stress Level</h3>
-                <div className="metric-value" style={{ color: getScoreColor(data.stress.score) }}>
-                  {data.stress.score.toFixed(1)}
+              {data.stress && (
+                <div className="metric-card">
+                  <h3>😌 Stress Level</h3>
+                  <div className="metric-value" style={{ color: getScoreColor(data.stress?.score || 0) }}>
+                    {(data.stress?.score || 0).toFixed(1)}
+                  </div>
+                  <div className="metric-status">
+                    {(data.stress?.stress_level || 'low').toUpperCase()}
+                  </div>
                 </div>
-                <div className="metric-status">
-                  {data.stress.stress_level.toUpperCase()}
-                </div>
-              </div>
+              )}
             </div>
 
-            <div className="recommendations-card">
-              <h2>💡 Recommendations</h2>
-              <ul className="recommendations-list">
-                {data.recommendations.map((rec, idx) => (
-                  <li key={idx}>{rec}</li>
-                ))}
-              </ul>
-            </div>
+            {data.recommendations && data.recommendations.length > 0 && (
+              <div className="recommendations-card">
+                <h2>💡 Recommendations</h2>
+                <ul className="recommendations-list">
+                  {data.recommendations.map((rec, idx) => (
+                    <li key={idx}>{rec}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
             {isConnected && (
               <button onClick={stopCamera} className="stop-button">

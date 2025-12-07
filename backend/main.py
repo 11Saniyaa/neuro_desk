@@ -1,5 +1,7 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Body
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import cv2
 import numpy as np
 import base64
@@ -26,6 +28,9 @@ app.add_middleware(
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 sessions: Dict[str, Dict] = {}
+
+class AnalyzeRequest(BaseModel):
+    image: str
 
 class WellnessAnalyzer:
     def __init__(self):
@@ -174,6 +179,112 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+@app.post("/analyze")
+async def analyze_frame(request: AnalyzeRequest):
+    """HTTP endpoint for frame analysis (alternative to WebSocket)"""
+    try:
+        image_data = request.image
+        if not image_data:
+            logging.warning("No image data provided")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "No image data provided",
+                    "timestamp": datetime.now().isoformat(),
+                    "posture": {"slouching": False, "score": 70},
+                    "eye_strain": {"eye_strain_risk": "low", "score": 100},
+                    "engagement": {"concentration": "low", "score": 50},
+                    "stress": {"stress_level": "low", "score": 100},
+                    "productivity": {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False},
+                    "recommendations": ["⚠️ No image data"]
+                }
+            )
+        
+        logging.info(f"Received image data, length: {len(image_data)}")
+        
+        # Decode image
+        try:
+            image = decode_image(image_data)
+            logging.info(f"Image decoded successfully, shape: {image.shape}")
+        except Exception as decode_err:
+            logging.error(f"Error decoding image: {decode_err}", exc_info=True)
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"Image decode error: {str(decode_err)}",
+                    "timestamp": datetime.now().isoformat(),
+                    "posture": {"slouching": False, "score": 70},
+                    "eye_strain": {"eye_strain_risk": "low", "score": 100},
+                    "engagement": {"concentration": "low", "score": 50},
+                    "stress": {"stress_level": "low", "score": 100},
+                    "productivity": {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False},
+                    "recommendations": ["⚠️ Image decode failed"]
+                }
+            )
+        
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            
+            # Detect face
+            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+            face_rect = faces[0] if len(faces) > 0 else None
+            logging.info(f"Face detection: {len(faces)} faces found")
+        except Exception as face_err:
+            logging.error(f"Error in face detection: {face_err}", exc_info=True)
+            face_rect = None
+        
+        # Analyze
+        try:
+            posture = analyzer.analyze_posture(image, face_rect)
+            eye_strain = analyzer.analyze_eye_strain(image, face_rect)
+            engagement = analyzer.analyze_engagement(face_rect)
+            stress = analyzer.analyze_stress(image, face_rect)
+            
+            # Calculate productivity
+            productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
+            
+            # Get recommendations
+            recommendations = analyzer.get_recommendations({
+                **productivity,
+                "stress_level": stress["stress_level"]
+            })
+            
+            # Prepare response
+            response = {
+                "timestamp": datetime.now().isoformat(),
+                "posture": posture,
+                "eye_strain": eye_strain,
+                "engagement": engagement,
+                "stress": stress,
+                "productivity": productivity,
+                "recommendations": recommendations
+            }
+            
+            logging.info(f"Analysis complete, productivity score: {productivity.get('productivity_score', 'N/A')}")
+            return response
+        except Exception as analysis_err:
+            logging.error(f"Error in analysis: {analysis_err}", exc_info=True)
+            raise
+        
+    except Exception as e:
+        logging.error(f"Error in analyze endpoint: {e}", exc_info=True)
+        import traceback
+        error_trace = traceback.format_exc()
+        logging.error(f"Full traceback: {error_trace}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": str(e),
+                "timestamp": datetime.now().isoformat(),
+                "posture": {"slouching": False, "score": 70},
+                "eye_strain": {"eye_strain_risk": "low", "score": 100},
+                "engagement": {"concentration": "low", "score": 50},
+                "stress": {"stress_level": "low", "score": 100},
+                "productivity": {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False},
+                "recommendations": ["⚠️ Analysis error occurred"]
+            }
+        )
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

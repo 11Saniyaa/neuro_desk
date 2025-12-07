@@ -9,6 +9,14 @@ export default defineConfig({
       '/ws': {
         target: 'ws://localhost:8000',
         ws: true
+      },
+      '/analyze': {
+        target: 'http://localhost:8000',
+        changeOrigin: true
+      },
+      '/api': {
+        target: 'http://localhost:8000',
+        changeOrigin: true
       }
     }
   }
