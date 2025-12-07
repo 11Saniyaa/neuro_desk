@@ -6,6 +6,11 @@ import base64
 from typing import Dict
 import json
 from datetime import datetime
+import logging
+import traceback
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = FastAPI(title="HCI Coach API")
 
@@ -159,7 +164,7 @@ def decode_image(image_data: str) -> np.ndarray:
         
         return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     except Exception as e:
-        print(f"Error decoding image: {e}")
+        logging.error(f"Error decoding image: {e}", exc_info=True)
         raise
 
 @app.get("/")
@@ -179,9 +184,9 @@ async def websocket_endpoint(websocket: WebSocket):
             "start_time": datetime.now(),
             "frame_count": 0
         }
-        print(f"WebSocket connection established: {session_id}")
+        logging.info(f"WebSocket connection established: {session_id}")
     except Exception as e:
-        print(f"Error accepting WebSocket connection: {e}")
+        logging.error(f"Error accepting WebSocket connection: {e}", exc_info=True)
         return
     
     try:
@@ -190,7 +195,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 data = await websocket.receive_text()
                 frame_data = json.loads(data)
             except Exception as e:
-                print(f"Error receiving/parsing data: {e}")
+                logging.error(f"Error receiving/parsing data: {e}", exc_info=True)
                 # Send error response and continue
                 try:
                     response = {
@@ -217,7 +222,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 faces = face_cascade.detectMultiScale(gray, 1.1, 4)
                 face_rect = faces[0] if len(faces) > 0 else None
             except Exception as e:
-                print(f"Image processing error: {e}")
+                logging.error(f"Image processing error: {e}", exc_info=True)
                 # Send error response but keep connection alive
                 try:
                     response = {
@@ -232,7 +237,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     }
                     await websocket.send_json(response)
                 except Exception as send_err:
-                    print(f"Error sending error response: {send_err}")
+                    logging.error(f"Error sending error response: {send_err}", exc_info=True)
                     break  # If we can't send, connection is broken
                 continue
             
@@ -267,17 +272,15 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 await websocket.send_json(response)
             except Exception as send_err:
-                print(f"Error sending response: {send_err}")
+                logging.error(f"Error sending response: {send_err}", exc_info=True)
                 break  # Connection broken, exit loop
             
     except WebSocketDisconnect:
-        print(f"WebSocket disconnected: {session_id}")
+        logging.info(f"WebSocket disconnected: {session_id}")
         if session_id in sessions:
             del sessions[session_id]
     except Exception as e:
-        print(f"WebSocket error for {session_id}: {e}")
-        import traceback
-        traceback.print_exc()
+        logging.error(f"WebSocket error for {session_id}: {e}", exc_info=True)
         try:
             await websocket.close()
         except:
