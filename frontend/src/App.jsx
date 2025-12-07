@@ -370,9 +370,9 @@ function App() {
   }, [stopSendingFrames])
 
   const getScoreColor = (score) => {
-    if (score >= 80) return '#10b981'
-    if (score >= 60) return '#f59e0b'
-    return '#ef4444'
+    if (score >= 80) return '#60a5fa' // Bright blue for excellent
+    if (score >= 60) return '#3b82f6' // Medium blue for good
+    return '#ef4444' // Red for poor
   }
 
   const getStatusIcon = (status) => {
