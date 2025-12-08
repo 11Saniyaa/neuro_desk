@@ -60,6 +60,9 @@ app.add_middleware(
 
 sessions: Dict[str, Dict] = {}
 
+# Frame skipping configuration
+FRAME_SKIP = 3  # Process every Nth frame (3 = process every 3rd frame, 66% reduction)
+
 def get_session_history(session_id: str) -> Tuple[deque, deque]:
     """Get or create session history for temporal smoothing"""
     if session_id not in sessions:
@@ -67,7 +70,9 @@ def get_session_history(session_id: str) -> Tuple[deque, deque]:
             "start_time": datetime.now(),
             "frame_count": 0,
             "ear_history": deque(maxlen=30),
-            "head_position_history": deque(maxlen=30)
+            "head_position_history": deque(maxlen=30),
+            "last_result": None,  # Cache for frame skipping
+            "last_result_time": None
         }
     session = sessions[session_id]
     return session.get("ear_history", deque(maxlen=30)), session.get("head_position_history", deque(maxlen=30))
@@ -1096,6 +1101,24 @@ async def analyze_frame(request: AnalyzeRequest):
         
         # Get session history for temporal smoothing
         session_id = "http_session"
+        session_data = sessions.get(session_id, {})
+        frame_count = session_data.get("frame_count", 0)
+        
+        # Frame skipping: Process every Nth frame, return cached result for others
+        should_process = (frame_count % FRAME_SKIP == 0)
+        
+        # Check if we have a recent cached result (within last 1 second)
+        if not should_process and session_data.get("last_result"):
+            last_result_time = session_data.get("last_result_time")
+            if last_result_time and (datetime.now() - last_result_time).total_seconds() < 1.0:
+                logging.debug(f"Frame {frame_count}: Using cached result (frame skipping)")
+                return JSONResponse(content=session_data["last_result"], status_code=200)
+        
+        # Update frame count
+        if session_id not in sessions:
+            get_session_history(session_id)  # Initialize session
+        sessions[session_id]["frame_count"] = frame_count + 1
+        
         ear_history, head_position_history = get_session_history(session_id)
         
         # Analyze
@@ -1128,6 +1151,12 @@ async def analyze_frame(request: AnalyzeRequest):
             
             logging.info(f"Analysis complete - Posture: {posture.get('score', 'N/A')}, Eye: {eye_strain.get('score', 'N/A')}, Engagement: {engagement.get('score', 'N/A')}, Stress: {stress.get('score', 'N/A')}, Productivity: {productivity.get('productivity_score', 'N/A')}")
             logging.info(f"Face detected: {face_results is not None}, Landmarks: {landmarks is not None and len(landmarks) > 0 if landmarks else False}")
+            
+            # Cache result for frame skipping
+            if session_id in sessions:
+                sessions[session_id]["last_result"] = response
+                sessions[session_id]["last_result_time"] = datetime.now()
+            
             return JSONResponse(content=response, status_code=200)
         except Exception as analysis_err:
             logging.error(f"Error in analysis: {analysis_err}", exc_info=True)
@@ -1234,6 +1263,27 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
             
             # Get session history for temporal smoothing
+            session_data = sessions.get(session_id, {})
+            frame_count = session_data.get("frame_count", 0)
+            
+            # Frame skipping: Process every Nth frame, return cached result for others
+            should_process = (frame_count % FRAME_SKIP == 0)
+            
+            # Check if we have a recent cached result (within last 1 second)
+            if not should_process and session_data.get("last_result"):
+                last_result_time = session_data.get("last_result_time")
+                if last_result_time and (datetime.now() - last_result_time).total_seconds() < 1.0:
+                    logging.debug(f"Frame {frame_count}: Using cached result (frame skipping)")
+                    try:
+                        await websocket.send_json(session_data["last_result"])
+                        sessions[session_id]["frame_count"] = frame_count + 1
+                        continue
+                    except:
+                        pass  # If send fails, process normally
+            
+            # Update frame count
+            sessions[session_id]["frame_count"] = frame_count + 1
+            
             ear_history, head_position_history = get_session_history(session_id)
             
             # Analyze
@@ -1263,7 +1313,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 "recommendations": recommendations
             }
             
-            sessions[session_id]["frame_count"] += 1
+            # Cache result for frame skipping
+            sessions[session_id]["last_result"] = response
+            sessions[session_id]["last_result_time"] = datetime.now()
             
             try:
                 await websocket.send_json(response)
