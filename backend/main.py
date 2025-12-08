@@ -87,142 +87,220 @@ class WellnessAnalyzer:
         # Right eye: [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
         self.LEFT_EYE_INDICES = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
         self.RIGHT_EYE_INDICES = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
-        # Key points for eye aspect ratio (EAR) calculation
-        self.LEFT_EYE_POINTS = [33, 160, 158, 153, 133, 157]  # Outer, inner corners and top/bottom
-        self.RIGHT_EYE_POINTS = [362, 385, 387, 380, 374, 386]
+        # Improved EAR points - using more accurate landmarks for better precision
+        # Left eye: outer corner, inner corner, top center, bottom center, top outer, bottom outer
+        self.LEFT_EYE_POINTS = [33, 133, 159, 145, 157, 153]  # More accurate points
+        self.RIGHT_EYE_POINTS = [362, 386, 380, 374, 388, 390]  # More accurate points
+        
         # Face boundary points for head pose estimation
         self.FACE_BOUNDARY = [10, 151, 9, 175, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
         
+        # Adaptive thresholds (will adjust based on user patterns)
+        self.ear_baseline = 0.28  # Will adapt
+        self.ear_std = 0.03  # Will adapt
+        self.blink_state = {"left": "open", "right": "open", "consecutive_closed": 0}
+        
+        # Confidence thresholds
+        self.min_face_confidence = 0.6  # Higher confidence required
+        self.min_landmark_quality = 0.7  # Quality threshold for landmarks
+        
+    def validate_image_quality(self, image: np.ndarray) -> Dict:
+        """Validate image quality before processing"""
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if len(image.shape) == 3 else image
+            
+            # Brightness check
+            brightness = np.mean(gray) / 255.0
+            if brightness < 0.15:
+                return {"valid": False, "reason": "too_dark", "brightness": brightness}
+            if brightness > 0.95:
+                return {"valid": False, "reason": "too_bright", "brightness": brightness}
+            
+            # Blur detection using Laplacian variance
+            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if laplacian_var < 50:
+                return {"valid": False, "reason": "too_blurry", "sharpness": laplacian_var}
+            
+            # Contrast check
+            contrast = np.std(gray) / 255.0
+            if contrast < 0.1:
+                return {"valid": False, "reason": "low_contrast", "contrast": contrast}
+            
+            return {
+                "valid": True,
+                "brightness": brightness,
+                "sharpness": laplacian_var,
+                "contrast": contrast,
+                "quality_score": min(100, (brightness * 30 + min(1, laplacian_var/200) * 40 + contrast * 30))
+            }
+        except Exception as e:
+            logging.warning(f"Error validating image quality: {e}")
+            return {"valid": True, "quality_score": 70}  # Default to valid if check fails
+    
     def calculate_eye_aspect_ratio(self, landmarks, eye_points) -> float:
-        """Calculate Eye Aspect Ratio (EAR) using 6-point method - scientifically validated"""
+        """Calculate Eye Aspect Ratio (EAR) using improved 6-point method with validation"""
         if not landmarks or len(landmarks) < 468:
             return 0.0
         
         try:
-            # Get eye landmark coordinates in proper order
-            # Standard EAR uses: outer corner, inner corner, top, bottom points
+            # Get eye landmark coordinates with validation
             eye_coords = []
             for idx in eye_points:
                 if idx < len(landmarks) and landmarks[idx] is not None:
                     landmark = landmarks[idx]
-                    eye_coords.append(np.array([landmark.x, landmark.y]))
+                    # Validate landmark coordinates
+                    if 0 <= landmark.x <= 1 and 0 <= landmark.y <= 1:
+                        eye_coords.append(np.array([landmark.x, landmark.y]))
             
             if len(eye_coords) < 6:
                 return 0.0
             
-            # EAR formula: (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
-            # Where p1=outer corner, p4=inner corner, p2/p3=top, p5/p6=bottom
-            # For MediaPipe: [outer, inner, top1, top2, bottom1, bottom2]
-            p1 = eye_coords[0]  # Outer corner
-            p4 = eye_coords[3]  # Inner corner
-            p2 = eye_coords[2]  # Top point 1
-            p3 = eye_coords[1]  # Top point 2
-            p5 = eye_coords[4]  # Bottom point 1
-            p6 = eye_coords[5]  # Bottom point 2
+            # Improved EAR calculation with better point selection
+            # Points: [outer_corner, inner_corner, top_center, bottom_center, top_outer, bottom_outer]
+            p_outer = eye_coords[0]  # Outer corner
+            p_inner = eye_coords[1]  # Inner corner
+            p_top = eye_coords[2]    # Top center
+            p_bottom = eye_coords[3] # Bottom center
+            p_top_outer = eye_coords[4]  # Top outer
+            p_bottom_outer = eye_coords[5]  # Bottom outer
             
-            # Calculate vertical distances (eye opening height)
-            vertical_1 = np.linalg.norm(p2 - p6)
-            vertical_2 = np.linalg.norm(p3 - p5)
+            # Calculate vertical distances (more accurate using center points)
+            vertical_1 = np.linalg.norm(p_top - p_bottom)
+            # Also use outer points for validation
+            vertical_2 = np.linalg.norm(p_top_outer - p_bottom_outer)
             
             # Calculate horizontal distance (eye width)
-            horizontal = np.linalg.norm(p1 - p4)
+            horizontal = np.linalg.norm(p_outer - p_inner)
             
-            # EAR formula - normalized ratio
-            if horizontal == 0:
+            # Validate measurements
+            if horizontal < 0.01:  # Too small, likely invalid
                 return 0.0
             
-            ear = (vertical_1 + vertical_2) / (2.0 * horizontal)
-            return max(0.0, min(1.0, ear))  # Clamp between 0 and 1
+            # Improved EAR: average of center and outer measurements for robustness
+            ear_center = vertical_1 / horizontal
+            ear_outer = vertical_2 / horizontal if vertical_2 > 0 else ear_center
+            ear = (ear_center + ear_outer) / 2.0
+            
+            # Additional validation: check if measurements are reasonable
+            if ear > 0.5 or ear < 0.05:  # Unrealistic values
+                return 0.0
+            
+            return max(0.0, min(1.0, ear))
         except Exception as e:
             logging.warning(f"Error calculating EAR: {e}")
             return 0.0
     
     def calculate_head_pose(self, landmarks, image_shape) -> Dict:
-        """Estimate head pose using 3D facial landmark analysis"""
+        """Improved head pose estimation using multiple reference points and validation"""
         if not landmarks or len(landmarks) < 468:
-            return {"pitch": 0, "yaw": 0, "roll": 0, "tilted": False}
+            return {"pitch": 0, "yaw": 0, "roll": 0, "tilted": False, "confidence": 0}
         
         h, w = image_shape[:2]
         
         try:
-            # Get key facial points for pose estimation
-            # Nose tip (3D reference point)
+            # Get multiple reference points for robust pose estimation
             nose_tip = landmarks[4]
-            # Chin center
             chin = landmarks[152]
-            # Forehead center
             forehead = landmarks[10]
-            # Left and right cheek points (for roll calculation)
             left_cheek = landmarks[234]
             right_cheek = landmarks[454]
-            # Eye corners for more accurate roll
             left_eye_outer = landmarks[33]
             right_eye_outer = landmarks[362]
             left_eye_inner = landmarks[133]
             right_eye_inner = landmarks[362]
+            nose_bridge = landmarks[6]  # Additional reference
             
             # Convert to pixel coordinates
-            nose_pt = np.array([nose_tip.x * w, nose_tip.y * h, nose_tip.z if hasattr(nose_tip, 'z') else 0])
-            chin_pt = np.array([chin.x * w, chin.y * h, chin.z if hasattr(chin, 'z') else 0])
-            forehead_pt = np.array([forehead.x * w, forehead.y * h, forehead.z if hasattr(forehead, 'z') else 0])
+            nose_pt = np.array([nose_tip.x * w, nose_tip.y * h])
+            chin_pt = np.array([chin.x * w, chin.y * h])
+            forehead_pt = np.array([forehead.x * w, forehead.y * h])
             left_pt = np.array([left_cheek.x * w, left_cheek.y * h])
             right_pt = np.array([right_cheek.x * w, right_cheek.y * h])
             left_eye_outer_pt = np.array([left_eye_outer.x * w, left_eye_outer.y * h])
             right_eye_outer_pt = np.array([right_eye_outer.x * w, right_eye_outer.y * h])
+            left_eye_inner_pt = np.array([left_eye_inner.x * w, left_eye_inner.y * h])
+            right_eye_inner_pt = np.array([right_eye_inner.x * w, right_eye_inner.y * h])
+            nose_bridge_pt = np.array([nose_bridge.x * w, nose_bridge.y * h])
             
-            # Calculate PITCH (nodding up/down) - forward/backward tilt
-            # Using face vertical line (forehead to chin)
-            face_vertical_vec = chin_pt[:2] - forehead_pt[:2]
+            # Calculate PITCH using multiple methods and average
+            # Method 1: Forehead to chin vector
+            face_vertical_vec = chin_pt - forehead_pt
             face_vertical_length = np.linalg.norm(face_vertical_vec)
-            if face_vertical_length > 0:
-                # Calculate angle from vertical (90 degrees = straight)
-                vertical_angle = np.arccos(np.clip(face_vertical_vec[1] / face_vertical_length, -1, 1)) * 180 / np.pi
-                pitch = 90 - vertical_angle
-                # Adjust based on face position (forward lean = positive pitch)
-                if nose_pt[1] > forehead_pt[1]:
-                    pitch = abs(pitch)  # Forward lean
-                else:
-                    pitch = -abs(pitch)  # Backward lean
-            else:
-                pitch = 0
             
-            # Calculate YAW (turning left/right) - horizontal rotation
-            # Using face width asymmetry
+            # Method 2: Nose bridge to chin (more stable)
+            nose_vertical_vec = chin_pt - nose_bridge_pt
+            nose_vertical_length = np.linalg.norm(nose_vertical_vec)
+            
+            pitch_values = []
+            if face_vertical_length > 0:
+                # Normalize vector
+                face_vertical_norm = face_vertical_vec / face_vertical_length
+                # Calculate angle from vertical (0 = straight up, 90 = horizontal)
+                pitch_1 = np.arcsin(np.clip(face_vertical_norm[0], -1, 1)) * 180 / np.pi
+                pitch_values.append(pitch_1)
+            
+            if nose_vertical_length > 0:
+                nose_vertical_norm = nose_vertical_vec / nose_vertical_length
+                pitch_2 = np.arcsin(np.clip(nose_vertical_norm[0], -1, 1)) * 180 / np.pi
+                pitch_values.append(pitch_2)
+            
+            # Average pitch from multiple methods
+            pitch = np.mean(pitch_values) if pitch_values else 0
+            
+            # Calculate YAW using multiple reference points
+            # Method 1: Face width asymmetry
             face_center_x = (left_pt[0] + right_pt[0]) / 2
             image_center_x = w / 2
             face_width = np.linalg.norm(right_pt - left_pt)
             
-            # Calculate yaw based on perspective (narrower visible width = more rotation)
+            # Method 2: Eye position asymmetry
+            eye_center_x = (left_eye_outer_pt[0] + right_eye_outer_pt[0]) / 2
+            eye_asymmetry = (eye_center_x - image_center_x) / w
+            
+            # Method 3: Nose position
+            nose_asymmetry = (nose_pt[0] - image_center_x) / w
+            
+            # Combine methods for robust yaw estimation
             if face_width > 0:
-                # Ideal face width ratio (empirically determined)
-                ideal_width_ratio = 0.4  # Face should be ~40% of image width when centered
+                ideal_width_ratio = 0.4
                 actual_width_ratio = face_width / w
-                width_ratio_diff = ideal_width_ratio - actual_width_ratio
-                
-                # Calculate yaw from width difference and position
-                position_offset = (face_center_x - image_center_x) / w
-                yaw = (width_ratio_diff * 60) + (position_offset * 25)  # Degrees
+                width_based_yaw = (ideal_width_ratio - actual_width_ratio) * 50
             else:
-                yaw = 0
+                width_based_yaw = 0
             
-            # Calculate ROLL (head tilt left/right) - using eye alignment
-            # More accurate using eye corners
-            eye_line_vec = right_eye_outer_pt - left_eye_outer_pt
-            eye_line_angle = np.arctan2(eye_line_vec[1], eye_line_vec[0]) * 180 / np.pi
-            roll = eye_line_angle  # 0 = horizontal, positive = tilted right
+            position_based_yaw = eye_asymmetry * 30 + nose_asymmetry * 20
+            yaw = (width_based_yaw * 0.4 + position_based_yaw * 0.6)
             
-            # Determine if significantly tilted
-            tilted = abs(pitch) > 12 or abs(yaw) > 18 or abs(roll) > 8
+            # Calculate ROLL using multiple eye reference points
+            # Method 1: Outer eye corners
+            eye_line_outer = right_eye_outer_pt - left_eye_outer_pt
+            roll_1 = np.arctan2(eye_line_outer[1], eye_line_outer[0]) * 180 / np.pi
+            
+            # Method 2: Inner eye corners (more stable)
+            eye_line_inner = right_eye_inner_pt - left_eye_inner_pt
+            roll_2 = np.arctan2(eye_line_inner[1], eye_line_inner[0]) * 180 / np.pi
+            
+            # Average roll
+            roll = (roll_1 + roll_2) / 2.0
+            
+            # Calculate confidence based on measurement consistency
+            pitch_consistency = 1.0 - (np.std(pitch_values) / 10.0) if len(pitch_values) > 1 else 0.8
+            roll_consistency = 1.0 - (abs(roll_1 - roll_2) / 5.0) if abs(roll_1 - roll_2) < 10 else 0.5
+            confidence = (pitch_consistency + roll_consistency) / 2.0
+            
+            # Determine if significantly tilted (with confidence threshold)
+            tilted = (abs(pitch) > 10 or abs(yaw) > 15 or abs(roll) > 7) and confidence > 0.6
             
             return {
                 "pitch": round(pitch, 2),
                 "yaw": round(yaw, 2),
                 "roll": round(roll, 2),
-                "tilted": tilted
+                "tilted": tilted,
+                "confidence": round(confidence, 2)
             }
         except Exception as e:
             logging.warning(f"Error calculating head pose: {e}")
-            return {"pitch": 0, "yaw": 0, "roll": 0, "tilted": False}
+            return {"pitch": 0, "yaw": 0, "roll": 0, "tilted": False, "confidence": 0}
     
     def analyze_posture(self, image, landmarks, face_detection_result) -> Dict:
         """Improved posture analysis using head pose and position"""
@@ -351,7 +429,7 @@ class WellnessAnalyzer:
                 "ear_avg": round(avg_ear, 3)
             }
         
-        # Calculate EAR for both eyes using proper 6-point method
+        # Calculate EAR for both eyes using improved method
         left_ear = self.calculate_eye_aspect_ratio(landmarks, self.LEFT_EYE_POINTS)
         right_ear = self.calculate_eye_aspect_ratio(landmarks, self.RIGHT_EYE_POINTS)
         
@@ -363,96 +441,136 @@ class WellnessAnalyzer:
         # Use average, or single eye if one is invalid
         if left_ear > 0 and right_ear > 0:
             avg_ear = (left_ear + right_ear) / 2.0
+            # Check for asymmetry (one eye more closed than other)
+            ear_asymmetry = abs(left_ear - right_ear) / max(left_ear, right_ear)
         elif left_ear > 0:
             avg_ear = left_ear
+            ear_asymmetry = 0
         elif right_ear > 0:
             avg_ear = right_ear
+            ear_asymmetry = 0
         else:
             avg_ear = 0.0
+            ear_asymmetry = 0
         
-        # Store in history for temporal analysis
+        # Store in history for temporal analysis with weighted smoothing
         if session_history is None:
             session_history = deque(maxlen=30)
         
         if avg_ear > 0:
-            session_history.append(avg_ear)
+            # Adaptive baseline: update baseline if we have enough history
+            if len(session_history) > 10:
+                recent_ears = list(session_history)[-10:]
+                self.ear_baseline = np.mean(recent_ears)
+                self.ear_std = np.std(recent_ears)
+            
+            # Weighted smoothing: recent frames have more weight
+            if len(session_history) > 0:
+                # Exponential moving average for smoother results
+                alpha = 0.3  # Smoothing factor
+                last_ear = session_history[-1] if session_history else avg_ear
+                smoothed_ear = alpha * avg_ear + (1 - alpha) * last_ear
+                session_history.append(smoothed_ear)
+            else:
+                session_history.append(avg_ear)
         
-        # Calculate blink rate using proper blink detection algorithm
-        # Blink = EAR drops below threshold then returns
+        # Improved blink detection with adaptive threshold
+        # Use adaptive threshold based on user's baseline
+        adaptive_blink_threshold = max(0.15, self.ear_baseline - 2 * self.ear_std) if self.ear_std > 0 else 0.20
         blink_count = 0
-        blink_threshold = 0.20  # Scientific threshold for eye closure
-        consecutive_low = 0
         
-        if len(session_history) > 10:
-            recent_ears = list(session_history)
+        if len(session_history) > 15:
+            recent_ears = list(session_history)[-20:]  # Use more frames for better detection
             prev_ear = recent_ears[0] if recent_ears else 0.3
             in_blink = False
+            blink_duration = 0
             
-            for ear in recent_ears[1:]:
-                if ear < blink_threshold and prev_ear >= blink_threshold:
+            for i, ear in enumerate(recent_ears[1:], 1):
+                # Detect blink start (EAR drops significantly)
+                if ear < adaptive_blink_threshold and prev_ear >= adaptive_blink_threshold:
                     # Blink started
                     in_blink = True
-                elif ear >= blink_threshold and prev_ear < blink_threshold and in_blink:
-                    # Blink completed
-                    blink_count += 1
+                    blink_duration = 1
+                elif ear < adaptive_blink_threshold and in_blink:
+                    # Still in blink
+                    blink_duration += 1
+                elif ear >= adaptive_blink_threshold and prev_ear < adaptive_blink_threshold and in_blink:
+                    # Blink completed (EAR returns above threshold)
+                    # Validate blink: should be 1-5 frames (not too short, not too long)
+                    if 1 <= blink_duration <= 5:
+                        blink_count += 1
                     in_blink = False
+                    blink_duration = 0
                 prev_ear = ear
             
-            # Calculate blink rate (blinks per frame, convert to per minute)
-            # Assuming ~5 FPS, 10 frames = 2 seconds
+            # Calculate blink rate (blinks per minute)
+            # Account for frame skipping: if FRAME_SKIP=3, actual FPS is ~1.67
+            actual_fps = 5.0 / FRAME_SKIP  # Adjust for frame skipping
             frames_analyzed = len(recent_ears)
-            blink_rate = (blink_count / frames_analyzed) * 5 * 60 if frames_analyzed > 0 else 0  # blinks per minute
+            time_seconds = frames_analyzed / actual_fps
+            blink_rate = (blink_count / time_seconds) * 60 if time_seconds > 0 else 0  # blinks per minute
             blink_rate_normalized = blink_rate / 20.0  # Normal is ~15-20 blinks/min
         else:
             blink_rate = 0
             blink_rate_normalized = 0
         
-        # Analyze eye strain using scientific metrics
-        # Normal EAR: 0.25-0.30 (open eyes)
-        # Closed eyes: < 0.20
-        # Tired/droopy: 0.20-0.25
-        
+        # Improved eye strain analysis with adaptive thresholds
+        # Use user's baseline for personalized analysis
         strain_factors = []
         strain_score_deduction = 0
         
-        # EAR-based analysis
+        # EAR-based analysis using adaptive thresholds
+        ear_deviation = abs(avg_ear - self.ear_baseline) if self.ear_baseline > 0 else abs(avg_ear - 0.28)
+        
         if avg_ear < 0.15:
             strain_factors.append("eyes_fully_closed")
-            strain_score_deduction += 30
+            strain_score_deduction += 35
         elif avg_ear < 0.20:
             strain_factors.append("eyes_nearly_closed")
-            strain_score_deduction += 20
+            strain_score_deduction += 25
         elif avg_ear < 0.25:
             strain_factors.append("eyes_droopy")
-            strain_score_deduction += 15
-        elif avg_ear > 0.35:
+            strain_score_deduction += 18
+        elif avg_ear > 0.38:
             strain_factors.append("eyes_wide_open")
-            strain_score_deduction += 5  # Wide open can indicate strain
+            strain_score_deduction += 8  # Wide open can indicate strain
+        elif ear_deviation > 2 * self.ear_std and self.ear_std > 0:
+            # Significant deviation from baseline
+            if avg_ear < self.ear_baseline:
+                strain_factors.append("eyes_below_baseline")
+                strain_score_deduction += 12
         
-        # Blink rate analysis (normal: 15-20 blinks/min)
-        if blink_rate_normalized < 0.3 and len(session_history) > 15:
+        # Improved blink rate analysis
+        if blink_rate_normalized < 0.25 and len(session_history) > 15:
             strain_factors.append("infrequent_blinking")
-            strain_score_deduction += 25  # Staring at screen
-        elif blink_rate_normalized > 1.5:
+            strain_score_deduction += 28  # Staring at screen
+        elif blink_rate_normalized > 1.8:
             strain_factors.append("excessive_blinking")
-            strain_score_deduction += 15  # Eye irritation
+            strain_score_deduction += 18  # Eye irritation
         
         # Asymmetry check (one eye more closed than other)
-        if left_ear > 0 and right_ear > 0:
-            ear_asymmetry = abs(left_ear - right_ear) / max(left_ear, right_ear)
-            if ear_asymmetry > 0.15:  # >15% difference
-                strain_factors.append("asymmetric_eye_closure")
-                strain_score_deduction += 10
+        if ear_asymmetry > 0.18:  # >18% difference (more strict)
+            strain_factors.append("asymmetric_eye_closure")
+            strain_score_deduction += 12
+        
+        # Temporal analysis: check for sustained low EAR
+        if len(session_history) > 10:
+            recent_low_ear_frames = sum(1 for ear in list(session_history)[-10:] if ear < 0.22)
+            if recent_low_ear_frames > 5:  # More than half of recent frames
+                strain_factors.append("sustained_eye_fatigue")
+                strain_score_deduction += 15
         
         # Calculate final score (100 = perfect, deduct for issues)
         base_score = 100
         eye_score = base_score - strain_score_deduction
         
-        # Determine risk level
-        if eye_score < 50:
+        # Determine risk level with confidence
+        if eye_score < 45:
             eye_strain_risk = "high"
-        elif eye_score < 70:
+        elif eye_score < 65:
             eye_strain_risk = "medium"
+        elif eye_score < 80:
+            eye_strain_risk = "low-medium"
         else:
             eye_strain_risk = "low"
         
@@ -1070,6 +1188,25 @@ async def analyze_frame(request: AnalyzeRequest):
         try:
             image = decode_image(image_data)
             logging.info(f"Image decoded successfully, shape: {image.shape}")
+            
+            # Validate image quality before processing
+            quality_check = analyzer.validate_image_quality(image)
+            if not quality_check.get("valid", True):
+                logging.warning(f"Poor image quality: {quality_check.get('reason')}")
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "error": f"Image quality too poor: {quality_check.get('reason')}",
+                        "quality_score": quality_check.get("quality_score", 0),
+                        "timestamp": datetime.now().isoformat(),
+                        "posture": {"slouching": False, "score": 70},
+                        "eye_strain": {"eye_strain_risk": "low", "score": 100},
+                        "engagement": {"concentration": "low", "score": 50},
+                        "stress": {"stress_level": "low", "score": 100},
+                        "productivity": {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False},
+                        "recommendations": [f"⚠️ Image quality issue: {quality_check.get('reason')}. Please improve lighting or camera focus."]
+                    }
+                )
         except Exception as decode_err:
             logging.error(f"Error decoding image: {decode_err}", exc_info=True)
             return JSONResponse(
