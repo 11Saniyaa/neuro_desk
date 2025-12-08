@@ -110,11 +110,29 @@ function App() {
           
           if (response.ok) {
             const result = await response.json()
+            // Validate response has required fields
+            if (!result || typeof result !== 'object') {
+              console.error('❌ Invalid response format:', result)
+              setError('Invalid response from server')
+              return
+            }
             console.log('✅ Received analysis data via HTTP:', {
-              timestamp: result.timestamp,
-              productivity: result.productivity?.productivity_score
+              timestamp: result.timestamp || 'N/A',
+              productivity: result.productivity?.productivity_score || 'N/A',
+              hasPosture: !!result.posture,
+              hasEyeStrain: !!result.eye_strain
             })
-            setData(result)
+            // Ensure all required fields exist with defaults
+            const safeResult = {
+              timestamp: result.timestamp || new Date().toISOString(),
+              posture: result.posture || { slouching: false, score: 70 },
+              eye_strain: result.eye_strain || { eye_strain_risk: 'low', score: 100 },
+              engagement: result.engagement || { concentration: 'low', score: 50 },
+              stress: result.stress || { stress_level: 'low', score: 100 },
+              productivity: result.productivity || { productivity_score: 70, break_needed: false },
+              recommendations: result.recommendations || []
+            }
+            setData(safeResult)
             setIsAnalyzing(true)
             setError(null)
           } else {
@@ -140,8 +158,10 @@ function App() {
           } else if (fetchErr.message.includes('Failed to fetch') || fetchErr.message.includes('NetworkError') || fetchErr.message.includes('ERR_CONNECTION_REFUSED')) {
             setError('Cannot connect to backend. Make sure backend is running on http://localhost:8000')
           } else {
-            setError(`Connection error: ${fetchErr.message}`)
+            setError(`Connection error: ${fetchErr.message || 'Unknown error'}`)
           }
+          // Don't clear data on error - keep showing last results
+          setIsAnalyzing(false)
         } finally {
           isSending = false
           // Throttle to ~5 FPS (200ms between frames) to reduce backend load
@@ -211,25 +231,50 @@ function App() {
 
       ws.onmessage = (event) => {
         try {
+          if (!event.data) {
+            console.error('❌ Empty WebSocket message received')
+            return
+          }
+          
           const response = JSON.parse(event.data)
+          
+          // Validate response
+          if (!response || typeof response !== 'object') {
+            console.error('❌ Invalid WebSocket response format:', response)
+            setError('Invalid response from server')
+            return
+          }
+          
           console.log('✅ Received analysis data:', {
-            timestamp: response.timestamp,
-            productivity: response.productivity?.productivity_score,
+            timestamp: response.timestamp || 'N/A',
+            productivity: response.productivity?.productivity_score || 'N/A',
             hasRecommendations: response.recommendations?.length > 0,
             hasPosture: !!response.posture,
             hasEyeStrain: !!response.eye_strain,
             hasEngagement: !!response.engagement,
             hasStress: !!response.stress
           })
-          console.log('Full response:', response)
-          setData(response)
+          
+          // Ensure all required fields exist with defaults
+          const safeResponse = {
+            timestamp: response.timestamp || new Date().toISOString(),
+            posture: response.posture || { slouching: false, score: 70 },
+            eye_strain: response.eye_strain || { eye_strain_risk: 'low', score: 100 },
+            engagement: response.engagement || { concentration: 'low', score: 50 },
+            stress: response.stress || { stress_level: 'low', score: 100 },
+            productivity: response.productivity || { productivity_score: 70, break_needed: false },
+            recommendations: response.recommendations || []
+          }
+          
+          console.log('Full response:', safeResponse)
+          setData(safeResponse)
           setIsAnalyzing(true) // Keep analyzing if we're receiving data
           setError(null) // Clear any previous errors
           console.log('✅ Data state updated, should display now')
         } catch (err) {
           console.error('❌ Error parsing WebSocket message:', err)
           console.error('Raw message:', event.data)
-          setError('Error processing server response')
+          setError(`Error processing server response: ${err.message}`)
         }
       }
 
