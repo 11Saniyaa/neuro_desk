@@ -119,43 +119,77 @@ class WellnessAnalyzer:
     
     def _calibrate_posture(self):
         """Calibrate to user's normal posture position"""
-        if len(self.user_calibration["posture_samples"]) < 30:
-            return
-        
-        samples = list(self.user_calibration["posture_samples"])
-        avg_face_y = np.mean([s["face_y"] for s in samples])
-        avg_face_x = np.mean([s["face_x"] for s in samples])
-        avg_pitch = np.mean([abs(s["pitch"]) for s in samples])
-        
-        # Store user's baseline
-        self.user_calibration["baseline_face_y"] = avg_face_y
-        self.user_calibration["baseline_face_x"] = avg_face_x
-        self.user_calibration["baseline_pitch"] = avg_pitch
-        self.user_calibration["calibrated"] = True
-        self.user_calibration["calibration_time"] = datetime.now()
-        
-        logging.info(f"User posture calibrated: face_y={avg_face_y:.3f}, face_x={avg_face_x:.3f}, pitch={avg_pitch:.2f}")
+        try:
+            if len(self.user_calibration["posture_samples"]) < 30:
+                return
+            
+            samples = list(self.user_calibration["posture_samples"])
+            if not samples:
+                return
+            
+            avg_face_y = np.mean([s["face_y"] for s in samples if "face_y" in s])
+            avg_face_x = np.mean([s["face_x"] for s in samples if "face_x" in s])
+            avg_pitch = np.mean([abs(s["pitch"]) for s in samples if "pitch" in s])
+            
+            # Validate values
+            if not (0 <= avg_face_y <= 1 and 0 <= avg_face_x <= 1):
+                logging.warning(f"Invalid calibration values: face_y={avg_face_y}, face_x={avg_face_x}")
+                return
+            
+            # Store user's baseline
+            self.user_calibration["baseline_face_y"] = avg_face_y
+            self.user_calibration["baseline_face_x"] = avg_face_x
+            self.user_calibration["baseline_pitch"] = avg_pitch
+            self.user_calibration["calibrated"] = True
+            self.user_calibration["calibration_time"] = datetime.now()
+            
+            logging.info(f"User posture calibrated: face_y={avg_face_y:.3f}, face_x={avg_face_x:.3f}, pitch={avg_pitch:.2f}")
+        except Exception as e:
+            logging.error(f"Error in posture calibration: {e}", exc_info=True)
     
     def _calibrate_ear(self):
         """Calibrate to user's normal EAR"""
-        if len(self.user_calibration["ear_samples"]) < 50:
-            return
-        
-        samples = list(self.user_calibration["ear_samples"])
-        self.ear_baseline = np.mean(samples)
-        self.ear_std = np.std(samples)
-        logging.info(f"User EAR calibrated: baseline={self.ear_baseline:.3f}, std={self.ear_std:.3f}")
+        try:
+            if len(self.user_calibration["ear_samples"]) < 50:
+                return
+            
+            samples = list(self.user_calibration["ear_samples"])
+            if not samples:
+                return
+            
+            self.ear_baseline = np.mean(samples)
+            self.ear_std = np.std(samples)
+            
+            # Validate values
+            if not (0.15 <= self.ear_baseline <= 0.40):
+                logging.warning(f"Invalid EAR baseline: {self.ear_baseline}, using default")
+                self.ear_baseline = 0.28
+                self.ear_std = 0.03
+                return
+            
+            if self.ear_std <= 0:
+                self.ear_std = 0.03  # Default std if too small
+            
+            logging.info(f"User EAR calibrated: baseline={self.ear_baseline:.3f}, std={self.ear_std:.3f}")
+        except Exception as e:
+            logging.error(f"Error in EAR calibration: {e}", exc_info=True)
     
     def _get_adaptive_posture_threshold(self, face_center_y):
         """Get adaptive threshold based on user's calibrated baseline"""
-        if not self.user_calibration["calibrated"]:
-            # Use default range
-            return (0.28, 0.42)
-        
-        baseline_y = self.user_calibration["baseline_face_y"]
-        # Allow ±15% deviation from baseline
-        threshold_range = 0.15
-        return (baseline_y - threshold_range, baseline_y + threshold_range)
+        try:
+            if not self.user_calibration.get("calibrated", False):
+                # Use default range
+                return (0.28, 0.42)
+            
+            baseline_y = self.user_calibration.get("baseline_face_y", 0.35)
+            # Allow ±15% deviation from baseline, but clamp to valid range
+            threshold_range = 0.15
+            min_y = max(0.1, baseline_y - threshold_range)
+            max_y = min(0.9, baseline_y + threshold_range)
+            return (min_y, max_y)
+        except Exception as e:
+            logging.warning(f"Error getting adaptive threshold: {e}")
+            return (0.28, 0.42)  # Default range
         
     def _adapt_to_lighting(self, image: np.ndarray):
         """Adapt analysis to current lighting conditions"""
@@ -1438,24 +1472,53 @@ async def analyze_frame(request: AnalyzeRequest):
         ear_history, head_position_history = get_session_history(session_id)
         
         # Adapt to current conditions
-        analyzer._adapt_to_lighting(image)
+        try:
+            analyzer._adapt_to_lighting(image)
+        except Exception as e:
+            logging.warning(f"Lighting adaptation error: {e}")
         
-        # Analyze
+        # Analyze with comprehensive error handling
         try:
             posture = analyzer.analyze_posture(image, landmarks, face_results)
+        except Exception as e:
+            logging.error(f"Posture analysis error: {e}", exc_info=True)
+            posture = {"slouching": False, "score": 70, "head_angle": 0, "face_position_y": 0.5, "face_position_x": 0.5}
+        
+        try:
             eye_strain = analyzer.analyze_eye_strain(image, landmarks, ear_history)
+        except Exception as e:
+            logging.error(f"Eye strain analysis error: {e}", exc_info=True)
+            eye_strain = {"eye_strain_risk": "low", "score": 100, "blink_rate": 0, "ear_avg": 0.28}
+        
+        try:
             engagement = analyzer.analyze_engagement(landmarks, face_results, head_position_history, image.shape)
+        except Exception as e:
+            logging.error(f"Engagement analysis error: {e}", exc_info=True)
+            engagement = {"concentration": "low", "score": 50, "face_visible": True, "head_stability": 0}
+        
+        try:
             stress = analyzer.analyze_stress(image, landmarks, face_results)
-            
-            # Calculate productivity
+        except Exception as e:
+            logging.error(f"Stress analysis error: {e}", exc_info=True)
+            stress = {"stress_level": "low", "score": 100, "indicators": []}
+        
+        # Calculate productivity
+        try:
             productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
-            
-            # Get recommendations
+        except Exception as e:
+            logging.error(f"Productivity calculation error: {e}", exc_info=True)
+            productivity = {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False}
+        
+        # Get recommendations
+        try:
             recommendations = analyzer.get_recommendations({
                 **productivity,
-                "stress_level": stress["stress_level"],
+                "stress_level": stress.get("stress_level", "low"),
                 "blink_rate": eye_strain.get("blink_rate", 0)
             })
+        except Exception as e:
+            logging.error(f"Recommendations error: {e}", exc_info=True)
+            recommendations = []
             
             # Prepare response
             response = {
@@ -1474,7 +1537,8 @@ async def analyze_frame(request: AnalyzeRequest):
                         f"Engagement: {engagement.get('score', 'N/A')} (stability: {engagement.get('head_stability', 'N/A')}), "
                         f"Stress: {stress.get('score', 'N/A')} ({stress.get('stress_level', 'N/A')}), "
                         f"Productivity: {productivity.get('productivity_score', 'N/A')}")
-            logging.info(f"Face detected: {face_results is not None}, Landmarks: {landmarks is not None and len(landmarks) > 0 if landmarks else False}, "
+            has_landmarks = landmarks is not None and len(landmarks) > 0 if landmarks else False
+            logging.info(f"Face detected: {face_results is not None}, Landmarks: {has_landmarks}, "
                         f"Face center: ({posture.get('face_position_x', 'N/A')}, {posture.get('face_position_y', 'N/A')})")
             
             # Cache result for frame skipping
@@ -1508,6 +1572,7 @@ async def analyze_frame(request: AnalyzeRequest):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    session_id = None
     try:
         await websocket.accept()
         session_id = str(id(websocket))
@@ -1612,23 +1677,53 @@ async def websocket_endpoint(websocket: WebSocket):
             ear_history, head_position_history = get_session_history(session_id)
             
             # Adapt to current conditions
-            analyzer._adapt_to_lighting(image)
+            try:
+                analyzer._adapt_to_lighting(image)
+            except Exception as e:
+                logging.warning(f"Lighting adaptation error: {e}")
             
-            # Analyze
-            posture = analyzer.analyze_posture(image, landmarks, face_results)
-            eye_strain = analyzer.analyze_eye_strain(image, landmarks, ear_history)
-            engagement = analyzer.analyze_engagement(landmarks, face_results, head_position_history, image.shape)
-            stress = analyzer.analyze_stress(image, landmarks, face_results)
+            # Analyze with error handling
+            try:
+                posture = analyzer.analyze_posture(image, landmarks, face_results)
+            except Exception as e:
+                logging.error(f"Posture analysis error: {e}", exc_info=True)
+                posture = {"slouching": False, "score": 70, "head_angle": 0, "face_position_y": 0.5, "face_position_x": 0.5}
+            
+            try:
+                eye_strain = analyzer.analyze_eye_strain(image, landmarks, ear_history)
+            except Exception as e:
+                logging.error(f"Eye strain analysis error: {e}", exc_info=True)
+                eye_strain = {"eye_strain_risk": "low", "score": 100, "blink_rate": 0, "ear_avg": 0.28}
+            
+            try:
+                engagement = analyzer.analyze_engagement(landmarks, face_results, head_position_history, image.shape)
+            except Exception as e:
+                logging.error(f"Engagement analysis error: {e}", exc_info=True)
+                engagement = {"concentration": "low", "score": 50, "face_visible": True, "head_stability": 0}
+            
+            try:
+                stress = analyzer.analyze_stress(image, landmarks, face_results)
+            except Exception as e:
+                logging.error(f"Stress analysis error: {e}", exc_info=True)
+                stress = {"stress_level": "low", "score": 100, "indicators": []}
             
             # Calculate productivity
-            productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
+            try:
+                productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
+            except Exception as e:
+                logging.error(f"Productivity calculation error: {e}", exc_info=True)
+                productivity = {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False}
             
             # Get recommendations
-            recommendations = analyzer.get_recommendations({
-                **productivity,
-                "stress_level": stress["stress_level"],
-                "blink_rate": eye_strain.get("blink_rate", 0)
-            })
+            try:
+                recommendations = analyzer.get_recommendations({
+                    **productivity,
+                    "stress_level": stress.get("stress_level", "low"),
+                    "blink_rate": eye_strain.get("blink_rate", 0)
+                })
+            except Exception as e:
+                logging.error(f"Recommendations error: {e}", exc_info=True)
+                recommendations = []
             
             # Prepare response
             response = {
@@ -1642,11 +1737,15 @@ async def websocket_endpoint(websocket: WebSocket):
             }
             
             # Cache result for frame skipping
-            sessions[session_id]["last_result"] = response
-            sessions[session_id]["last_result_time"] = datetime.now()
+            if session_id in sessions:
+                sessions[session_id]["last_result"] = response
+                sessions[session_id]["last_result_time"] = datetime.now()
             
             try:
                 await websocket.send_json(response)
+            except (WebSocketDisconnect, RuntimeError) as send_err:
+                logging.info(f"WebSocket disconnected during send: {send_err}")
+                break  # Connection broken, exit loop
             except Exception as send_err:
                 logging.error(f"Error sending response: {send_err}", exc_info=True)
                 break  # Connection broken, exit loop
