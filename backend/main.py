@@ -305,13 +305,15 @@ class WellnessAnalyzer:
     def analyze_posture(self, image, landmarks, face_detection_result) -> Dict:
         """Improved posture analysis using head pose and position"""
         h, w = image.shape[:2]
-        face_center_x = 0.5
-        face_center_y = 0.5
-        head_pose = {"pitch": 0, "yaw": 0, "roll": 0, "tilted": False}
+        face_center_x = None
+        face_center_y = None
+        head_pose = {"pitch": 0, "yaw": 0, "roll": 0, "tilted": False, "confidence": 0}
+        face_detected = False
         
         # Try to get face position from detection result first
         if face_detection_result and hasattr(face_detection_result, 'detections') and len(face_detection_result.detections) > 0:
             detection = face_detection_result.detections[0]
+            face_detected = True
             if hasattr(detection, 'location_data') and hasattr(detection.location_data, 'relative_bounding_box'):
                 bbox = detection.location_data.relative_bounding_box
                 face_center_y = bbox.ymin + bbox.height / 2
@@ -323,54 +325,66 @@ class WellnessAnalyzer:
                 face_center_x = (x + fw / 2) / w
         elif landmarks and len(landmarks) >= 468 and landmarks[4] is not None:
             # Use landmarks if available
+            face_detected = True
             nose_tip = landmarks[4]
             face_center_y = nose_tip.y
             face_center_x = nose_tip.x
             head_pose = self.calculate_head_pose(landmarks, image.shape)
-        elif landmarks and len(landmarks) > 0:
+        elif landmarks and len(landmarks) > 0 and landmarks[0] is not None:
             # Use first available landmark as face center estimate
-            if landmarks[0] is not None:
-                face_center_y = landmarks[0].y
-                face_center_x = landmarks[0].x
-        else:
-            # No face detected - return low score
-            return {"slouching": True, "score": 40, "head_angle": 0, "reason": "no_face_detected"}
+            face_detected = True
+            face_center_y = landmarks[0].y
+            face_center_x = landmarks[0].x
         
-        # Analyze posture based on multiple factors
+        # If no face detected at all, return low score
+        if not face_detected or face_center_x is None or face_center_y is None:
+            return {"slouching": True, "score": 35, "head_angle": 0, "face_position_y": 0.5, "face_position_x": 0.5, "reason": "no_face_detected"}
+        
+        # Analyze posture based on multiple factors with more sensitivity
         # 1. Head pitch (forward lean = slouching) - only if we have pose data
-        if landmarks and len(landmarks) >= 468:
-            pitch_score = 100 - min(100, abs(head_pose["pitch"]) * 2)
+        if landmarks and len(landmarks) >= 468 and head_pose.get("confidence", 0) > 0.5:
+            # Use actual head pose with confidence weighting
+            pitch = head_pose["pitch"]
+            pitch_penalty = abs(pitch) * 3.5  # More sensitive (was 2)
+            pitch_score = 100 - min(90, pitch_penalty)
         else:
-            # Estimate pitch from face position
+            # Estimate pitch from face position with better sensitivity
             ideal_y = 0.35  # Ideal face position (upper third)
-            pitch_estimate = (face_center_y - ideal_y) * 50  # Convert to approximate pitch
-            pitch_score = 100 - min(100, abs(pitch_estimate) * 1.5)
+            y_deviation = face_center_y - ideal_y
+            pitch_estimate = y_deviation * 60  # More sensitive conversion
+            pitch_score = 100 - min(90, abs(pitch_estimate) * 2.0)  # More sensitive (was 1.5)
         
         # 2. Face vertical position (should be in upper portion for good posture)
         # Ideal position is around 0.3-0.4 (upper third to middle-upper)
-        ideal_y_range = (0.25, 0.45)
+        ideal_y_range = (0.28, 0.42)  # Slightly tighter range
         if face_center_y < ideal_y_range[0]:
-            vertical_score = 90 - (ideal_y_range[0] - face_center_y) * 100
+            # Too high (unlikely but possible)
+            vertical_penalty = (ideal_y_range[0] - face_center_y) * 80
+            vertical_score = 100 - min(30, vertical_penalty)
         elif face_center_y > ideal_y_range[1]:
-            vertical_penalty = (face_center_y - ideal_y_range[1]) * 150
-            vertical_score = 100 - min(80, vertical_penalty)
+            # Too low (slouching)
+            vertical_penalty = (face_center_y - ideal_y_range[1]) * 200  # More sensitive (was 150)
+            vertical_score = 100 - min(85, vertical_penalty)
         else:
-            vertical_score = 100  # In ideal range
+            # In ideal range - calculate score based on how centered
+            center_distance = abs(face_center_y - 0.35)  # Distance from perfect center
+            vertical_score = 100 - (center_distance * 50)  # Small penalty for not perfect
         
-        # 3. Head tilt (sideways lean)
-        if landmarks and len(landmarks) >= 468:
-            roll_penalty = min(50, abs(head_pose["roll"]) * 2)
+        # 3. Head tilt (sideways lean) - more sensitive
+        if landmarks and len(landmarks) >= 468 and head_pose.get("confidence", 0) > 0.5:
+            roll = abs(head_pose["roll"])
+            roll_penalty = min(60, roll * 2.5)  # More sensitive (was 2)
         else:
             roll_penalty = 0  # Can't detect roll without landmarks
         
-        # 4. Horizontal centering (face should be centered)
+        # 4. Horizontal centering (face should be centered) - more sensitive
         horizontal_offset = abs(face_center_x - 0.5)
-        horizontal_penalty = min(25, horizontal_offset * 50)
+        horizontal_penalty = min(30, horizontal_offset * 60)  # More sensitive (was 50)
         
         # Calculate overall posture score with dynamic weighting
-        base_score = (pitch_score * 0.4 + vertical_score * 0.4 + (100 - horizontal_penalty) * 0.2)
-        posture_score = base_score - roll_penalty * 0.3
-        posture_score = max(20, min(100, posture_score))  # Keep range 20-100 for visibility
+        base_score = (pitch_score * 0.35 + vertical_score * 0.45 + (100 - horizontal_penalty) * 0.2)
+        posture_score = base_score - roll_penalty * 0.35  # More weight on roll (was 0.3)
+        posture_score = max(15, min(100, posture_score))  # Wider range for visibility
         
         # Determine if slouching
         slouching = (
@@ -396,13 +410,13 @@ class WellnessAnalyzer:
         
         # If no landmarks, estimate based on face detection and time
         if landmarks is None or len(landmarks) < 468:
-            # Estimate eye strain based on session duration
+            # Estimate eye strain based on session duration and face detection
             if len(session_history) > 0:
                 # If we have history, use average
                 avg_ear = np.mean(list(session_history)) if session_history else 0.28
             else:
-                # Default moderate risk if no data
-                avg_ear = 0.28
+                # Estimate based on face detection if available
+                avg_ear = 0.28  # Default
                 session_history.append(avg_ear)
             
             # Estimate blink rate from history
@@ -414,13 +428,23 @@ class WellnessAnalyzer:
             else:
                 blink_rate = 0.15  # Normal blink rate
             
-            # Score based on estimated values
+            # Score based on estimated values with more variation
+            base_score = 80
+            if avg_ear < 0.24:
+                base_score -= 18
+            elif avg_ear > 0.32:
+                base_score += 8
+            
             if blink_rate < 0.05:
                 eye_strain_risk = "medium"
-                eye_score = 65
+                base_score -= 18
+            elif blink_rate > 0.25:
+                eye_strain_risk = "low-medium"
+                base_score -= 10
             else:
                 eye_strain_risk = "low"
-                eye_score = 85
+            
+            eye_score = max(45, min(95, base_score))
             
             return {
                 "eye_strain_risk": eye_strain_risk,
@@ -592,10 +616,18 @@ class WellnessAnalyzer:
         # Check if face is detected
         face_visible = False
         face_center = None
+        face_confidence = 0.0
         
         if face_detection_result and hasattr(face_detection_result, 'detections') and len(face_detection_result.detections) > 0:
             face_visible = True
             detection = face_detection_result.detections[0]
+            if hasattr(detection, 'score') and len(detection.score) > 0:
+                face_confidence = detection.score[0]
+            elif hasattr(detection, 'confidence'):
+                face_confidence = detection.confidence
+            else:
+                face_confidence = 0.7  # Default if no score available
+            
             if hasattr(detection, 'location_data') and hasattr(detection.location_data, 'relative_bounding_box'):
                 bbox = detection.location_data.relative_bounding_box
                 face_center = [bbox.xmin + bbox.width / 2, bbox.ymin + bbox.height / 2]
@@ -608,13 +640,14 @@ class WellnessAnalyzer:
                     face_center = [0.5, 0.5]
         elif landmarks and len(landmarks) > 0 and landmarks[0] is not None:
             face_visible = True
+            face_confidence = 0.7  # Medium confidence for landmarks
             if landmarks[4] is not None:  # Nose tip
                 face_center = [landmarks[4].x, landmarks[4].y]
             else:
                 face_center = [landmarks[0].x, landmarks[0].y]
         
-        if not face_visible:
-            return {"concentration": "low", "score": 25, "face_visible": False, "head_stability": 0}
+        if not face_visible or face_center is None:
+            return {"concentration": "low", "score": 20, "face_visible": False, "head_stability": 0}
         
         # Use provided image shape or default
         if image_shape is None:
@@ -624,66 +657,84 @@ class WellnessAnalyzer:
         if landmarks and len(landmarks) >= 468:
             head_pose = self.calculate_head_pose(landmarks, image_shape)
         else:
-            head_pose = {"pitch": 0, "yaw": 0, "roll": 0, "tilted": False}
+            head_pose = {"pitch": 0, "yaw": 0, "roll": 0, "tilted": False, "confidence": 0}
         
         # Track head movement (stability indicates focus)
         if face_center:
             session_history.append(face_center)
         
-        # Calculate movement variance
+        # Calculate movement variance with better sensitivity
         if len(session_history) > 5:
             positions = np.array(list(session_history)[-10:])
             movement_variance = np.var(positions, axis=0).sum()
+            # Also calculate average movement distance
+            if len(positions) > 1:
+                movement_distances = [np.linalg.norm(positions[i] - positions[i-1]) for i in range(1, len(positions))]
+                avg_movement = np.mean(movement_distances) if movement_distances else 0
+            else:
+                avg_movement = 0
         else:
             movement_variance = 0.01  # Default low movement
+            avg_movement = 0
         
-        # Analyze engagement factors
+        # Analyze engagement factors with more sensitivity
         # 1. Face visibility and confidence
-        visibility_score = 100 if face_visible else 30
+        visibility_score = 100 if face_visible else 20
+        confidence_score = face_confidence * 100 if face_confidence > 0 else 60
         
-        # 2. Head stability (low movement = focused)
-        if movement_variance < 0.0001:
+        # 2. Head stability (low movement = focused) - more sensitive
+        if movement_variance < 0.00005:  # Very stable
             stability_score = 100
-        elif movement_variance < 0.0005:
-            stability_score = 80
-        elif movement_variance < 0.001:
-            stability_score = 60
-        elif movement_variance < 0.002:
-            stability_score = 45
-        else:
-            stability_score = 30
+        elif movement_variance < 0.0002:  # Stable
+            stability_score = 90 - (movement_variance * 50000)
+        elif movement_variance < 0.0008:  # Moderate
+            stability_score = 75 - ((movement_variance - 0.0002) * 20000)
+        elif movement_variance < 0.002:  # Some movement
+            stability_score = 55 - ((movement_variance - 0.0008) * 8000)
+        else:  # High movement
+            stability_score = max(20, 35 - (movement_variance * 5000))
         
-        # 3. Head orientation (facing forward = engaged)
-        if landmarks and len(landmarks) >= 468:
-            yaw_penalty = min(50, abs(head_pose["yaw"]) * 2)
+        # 3. Head orientation (facing forward = engaged) - more sensitive
+        if landmarks and len(landmarks) >= 468 and head_pose.get("confidence", 0) > 0.5:
+            yaw = abs(head_pose["yaw"])
+            yaw_penalty = min(60, yaw * 2.5)  # More sensitive (was 2)
             orientation_score = 100 - yaw_penalty
         else:
-            # Estimate from face position
+            # Estimate from face position with better sensitivity
             if face_center:
                 horizontal_offset = abs(face_center[0] - 0.5)
-                orientation_score = 100 - min(40, horizontal_offset * 80)
+                orientation_score = 100 - min(50, horizontal_offset * 100)  # More sensitive (was 80)
             else:
                 orientation_score = 50
         
         # 4. Face size/confidence (larger face = closer = more engaged)
         if face_detection_result and hasattr(face_detection_result, 'detections') and len(face_detection_result.detections) > 0:
             detection = face_detection_result.detections[0]
-            if hasattr(detection, 'score') and len(detection.score) > 0:
-                confidence = detection.score[0]
-                confidence_score = confidence * 100
+            if hasattr(detection, 'location_data') and hasattr(detection.location_data, 'relative_bounding_box'):
+                bbox = detection.location_data.relative_bounding_box
+                face_size = bbox.width * bbox.height
+                # Larger face = closer = more engaged
+                if face_size > 0.15:
+                    size_bonus = 10
+                elif face_size > 0.10:
+                    size_bonus = 5
+                elif face_size < 0.05:
+                    size_bonus = -10
+                else:
+                    size_bonus = 0
             else:
-                confidence_score = 70
+                size_bonus = 0
         else:
-            confidence_score = 60
+            size_bonus = 0
         
         # Calculate overall engagement with dynamic weighting
         engagement_score = (
-            visibility_score * 0.25 + 
-            stability_score * 0.35 + 
-            orientation_score * 0.25 + 
-            confidence_score * 0.15
-        )
-        engagement_score = max(20, min(100, engagement_score))  # Keep range 20-100
+            visibility_score * 0.20 + 
+            stability_score * 0.40 + 
+            orientation_score * 0.30 + 
+            confidence_score * 0.10
+        ) + size_bonus
+        engagement_score = max(15, min(100, engagement_score))  # Wider range
         
         # Determine concentration level
         if engagement_score >= 75:
@@ -1231,7 +1282,15 @@ async def analyze_frame(request: AnalyzeRequest):
                 face_detected = True
             elif face_results:
                 face_detected = True
-            logging.info(f"Face detection: detected={face_detected}, has_landmarks={landmarks is not None and len(landmarks) > 0}, method={'MediaPipe' if MEDIAPIPE_AVAILABLE else 'OpenCV'}")
+            # Detailed face detection logging
+            has_landmarks = landmarks is not None and len(landmarks) > 0 if landmarks else False
+            logging.info(f"Face detection: detected={face_detected}, has_landmarks={has_landmarks}, method={'MediaPipe' if MEDIAPIPE_AVAILABLE else 'OpenCV'}")
+            if face_detected and face_results:
+                if hasattr(face_results, 'detections') and len(face_results.detections) > 0:
+                    detection = face_results.detections[0]
+                    if hasattr(detection, 'location_data') and hasattr(detection.location_data, 'relative_bounding_box'):
+                        bbox = detection.location_data.relative_bounding_box
+                        logging.info(f"Face bbox: x={bbox.xmin:.3f}, y={bbox.ymin:.3f}, w={bbox.width:.3f}, h={bbox.height:.3f}")
         except Exception as face_err:
             logging.error(f"Error in face detection: {face_err}", exc_info=True)
             face_results, landmarks, mesh_results = None, None, None
@@ -1286,8 +1345,14 @@ async def analyze_frame(request: AnalyzeRequest):
                 "recommendations": recommendations
             }
             
-            logging.info(f"Analysis complete - Posture: {posture.get('score', 'N/A')}, Eye: {eye_strain.get('score', 'N/A')}, Engagement: {engagement.get('score', 'N/A')}, Stress: {stress.get('score', 'N/A')}, Productivity: {productivity.get('productivity_score', 'N/A')}")
-            logging.info(f"Face detected: {face_results is not None}, Landmarks: {landmarks is not None and len(landmarks) > 0 if landmarks else False}")
+            # Detailed logging for debugging constant scores
+            logging.info(f"Analysis complete - Posture: {posture.get('score', 'N/A')} (face_y: {posture.get('face_position_y', 'N/A')}, head_angle: {posture.get('head_angle', 'N/A')}), "
+                        f"Eye: {eye_strain.get('score', 'N/A')} (EAR: {eye_strain.get('ear_avg', 'N/A')}, blinks: {eye_strain.get('blink_rate', 'N/A')}), "
+                        f"Engagement: {engagement.get('score', 'N/A')} (stability: {engagement.get('head_stability', 'N/A')}), "
+                        f"Stress: {stress.get('score', 'N/A')} ({stress.get('stress_level', 'N/A')}), "
+                        f"Productivity: {productivity.get('productivity_score', 'N/A')}")
+            logging.info(f"Face detected: {face_results is not None}, Landmarks: {landmarks is not None and len(landmarks) > 0 if landmarks else False}, "
+                        f"Face center: ({posture.get('face_position_x', 'N/A')}, {posture.get('face_position_y', 'N/A')})")
             
             # Cache result for frame skipping
             if session_id in sessions:
