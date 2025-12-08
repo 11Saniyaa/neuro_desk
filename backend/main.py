@@ -89,77 +89,125 @@ class WellnessAnalyzer:
         self.FACE_BOUNDARY = [10, 151, 9, 175, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
         
     def calculate_eye_aspect_ratio(self, landmarks, eye_points) -> float:
-        """Calculate Eye Aspect Ratio (EAR) - lower values indicate closed eyes"""
+        """Calculate Eye Aspect Ratio (EAR) using 6-point method - scientifically validated"""
         if not landmarks or len(landmarks) < 468:
-            return 0.3  # Default value
+            return 0.0
         
-        # Get eye landmark coordinates
-        eye_coords = []
-        for idx in eye_points:
-            if idx < len(landmarks):
-                landmark = landmarks[idx]
-                eye_coords.append([landmark.x, landmark.y])
-        
-        if len(eye_coords) < 6:
-            return 0.3
-        
-        eye_coords = np.array(eye_coords)
-        
-        # Calculate distances
-        # Vertical distances
-        v1 = np.linalg.norm(eye_coords[1] - eye_coords[5])
-        v2 = np.linalg.norm(eye_coords[2] - eye_coords[4])
-        # Horizontal distance
-        h = np.linalg.norm(eye_coords[0] - eye_coords[3])
-        
-        # EAR formula
-        if h == 0:
-            return 0.3
-        ear = (v1 + v2) / (2.0 * h)
-        return ear
+        try:
+            # Get eye landmark coordinates in proper order
+            # Standard EAR uses: outer corner, inner corner, top, bottom points
+            eye_coords = []
+            for idx in eye_points:
+                if idx < len(landmarks) and landmarks[idx] is not None:
+                    landmark = landmarks[idx]
+                    eye_coords.append(np.array([landmark.x, landmark.y]))
+            
+            if len(eye_coords) < 6:
+                return 0.0
+            
+            # EAR formula: (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
+            # Where p1=outer corner, p4=inner corner, p2/p3=top, p5/p6=bottom
+            # For MediaPipe: [outer, inner, top1, top2, bottom1, bottom2]
+            p1 = eye_coords[0]  # Outer corner
+            p4 = eye_coords[3]  # Inner corner
+            p2 = eye_coords[2]  # Top point 1
+            p3 = eye_coords[1]  # Top point 2
+            p5 = eye_coords[4]  # Bottom point 1
+            p6 = eye_coords[5]  # Bottom point 2
+            
+            # Calculate vertical distances (eye opening height)
+            vertical_1 = np.linalg.norm(p2 - p6)
+            vertical_2 = np.linalg.norm(p3 - p5)
+            
+            # Calculate horizontal distance (eye width)
+            horizontal = np.linalg.norm(p1 - p4)
+            
+            # EAR formula - normalized ratio
+            if horizontal == 0:
+                return 0.0
+            
+            ear = (vertical_1 + vertical_2) / (2.0 * horizontal)
+            return max(0.0, min(1.0, ear))  # Clamp between 0 and 1
+        except Exception as e:
+            logging.warning(f"Error calculating EAR: {e}")
+            return 0.0
     
     def calculate_head_pose(self, landmarks, image_shape) -> Dict:
-        """Estimate head pose (pitch, yaw, roll) from facial landmarks"""
+        """Estimate head pose using 3D facial landmark analysis"""
         if not landmarks or len(landmarks) < 468:
             return {"pitch": 0, "yaw": 0, "roll": 0, "tilted": False}
         
         h, w = image_shape[:2]
         
-        # Get key facial points
         try:
-            # Nose tip
+            # Get key facial points for pose estimation
+            # Nose tip (3D reference point)
             nose_tip = landmarks[4]
-            # Chin
+            # Chin center
             chin = landmarks[152]
             # Forehead center
             forehead = landmarks[10]
-            # Left and right face boundaries
-            left_face = landmarks[234]
-            right_face = landmarks[454]
+            # Left and right cheek points (for roll calculation)
+            left_cheek = landmarks[234]
+            right_cheek = landmarks[454]
+            # Eye corners for more accurate roll
+            left_eye_outer = landmarks[33]
+            right_eye_outer = landmarks[362]
+            left_eye_inner = landmarks[133]
+            right_eye_inner = landmarks[362]
             
             # Convert to pixel coordinates
-            nose_pt = np.array([nose_tip.x * w, nose_tip.y * h])
-            chin_pt = np.array([chin.x * w, chin.y * h])
-            forehead_pt = np.array([forehead.x * w, forehead.y * h])
-            left_pt = np.array([left_face.x * w, left_face.y * h])
-            right_pt = np.array([right_face.x * w, right_face.y * h])
+            nose_pt = np.array([nose_tip.x * w, nose_tip.y * h, nose_tip.z if hasattr(nose_tip, 'z') else 0])
+            chin_pt = np.array([chin.x * w, chin.y * h, chin.z if hasattr(chin, 'z') else 0])
+            forehead_pt = np.array([forehead.x * w, forehead.y * h, forehead.z if hasattr(forehead, 'z') else 0])
+            left_pt = np.array([left_cheek.x * w, left_cheek.y * h])
+            right_pt = np.array([right_cheek.x * w, right_cheek.y * h])
+            left_eye_outer_pt = np.array([left_eye_outer.x * w, left_eye_outer.y * h])
+            right_eye_outer_pt = np.array([right_eye_outer.x * w, right_eye_outer.y * h])
             
-            # Calculate angles
-            # Pitch (vertical tilt) - based on nose to chin vs forehead
-            face_vertical = chin_pt - forehead_pt
-            pitch = np.arctan2(face_vertical[1], abs(face_vertical[0])) * 180 / np.pi
+            # Calculate PITCH (nodding up/down) - forward/backward tilt
+            # Using face vertical line (forehead to chin)
+            face_vertical_vec = chin_pt[:2] - forehead_pt[:2]
+            face_vertical_length = np.linalg.norm(face_vertical_vec)
+            if face_vertical_length > 0:
+                # Calculate angle from vertical (90 degrees = straight)
+                vertical_angle = np.arccos(np.clip(face_vertical_vec[1] / face_vertical_length, -1, 1)) * 180 / np.pi
+                pitch = 90 - vertical_angle
+                # Adjust based on face position (forward lean = positive pitch)
+                if nose_pt[1] > forehead_pt[1]:
+                    pitch = abs(pitch)  # Forward lean
+                else:
+                    pitch = -abs(pitch)  # Backward lean
+            else:
+                pitch = 0
             
-            # Yaw (horizontal rotation) - based on face width
-            face_width = np.linalg.norm(right_pt - left_pt)
+            # Calculate YAW (turning left/right) - horizontal rotation
+            # Using face width asymmetry
             face_center_x = (left_pt[0] + right_pt[0]) / 2
             image_center_x = w / 2
-            yaw_offset = (face_center_x - image_center_x) / w
-            yaw = yaw_offset * 30  # Approximate degrees
+            face_width = np.linalg.norm(right_pt - left_pt)
             
-            # Roll (head tilt) - based on eye/face alignment
-            roll = np.arctan2(right_pt[1] - left_pt[1], right_pt[0] - left_pt[0]) * 180 / np.pi
+            # Calculate yaw based on perspective (narrower visible width = more rotation)
+            if face_width > 0:
+                # Ideal face width ratio (empirically determined)
+                ideal_width_ratio = 0.4  # Face should be ~40% of image width when centered
+                actual_width_ratio = face_width / w
+                width_ratio_diff = ideal_width_ratio - actual_width_ratio
+                
+                # Calculate yaw from width difference and position
+                position_offset = (face_center_x - image_center_x) / w
+                yaw = (width_ratio_diff * 60) + (position_offset * 25)  # Degrees
+            else:
+                yaw = 0
             
-            tilted = abs(pitch) > 15 or abs(yaw) > 20 or abs(roll) > 10
+            # Calculate ROLL (head tilt left/right) - using eye alignment
+            # More accurate using eye corners
+            eye_line_vec = right_eye_outer_pt - left_eye_outer_pt
+            eye_line_angle = np.arctan2(eye_line_vec[1], eye_line_vec[0]) * 180 / np.pi
+            roll = eye_line_angle  # 0 = horizontal, positive = tilted right
+            
+            # Determine if significantly tilted
+            tilted = abs(pitch) > 12 or abs(yaw) > 18 or abs(roll) > 8
             
             return {
                 "pitch": round(pitch, 2),
@@ -298,59 +346,110 @@ class WellnessAnalyzer:
                 "ear_avg": round(avg_ear, 3)
             }
         
-        # Calculate EAR for both eyes
+        # Calculate EAR for both eyes using proper 6-point method
         left_ear = self.calculate_eye_aspect_ratio(landmarks, self.LEFT_EYE_POINTS)
         right_ear = self.calculate_eye_aspect_ratio(landmarks, self.RIGHT_EYE_POINTS)
-        avg_ear = (left_ear + right_ear) / 2.0
+        
+        # Validate EAR values (normal range: 0.2-0.4)
+        if left_ear == 0.0 and right_ear == 0.0:
+            # No valid eye data
+            return {"eye_strain_risk": "unknown", "score": 50, "blink_rate": 0, "ear_avg": 0.0}
+        
+        # Use average, or single eye if one is invalid
+        if left_ear > 0 and right_ear > 0:
+            avg_ear = (left_ear + right_ear) / 2.0
+        elif left_ear > 0:
+            avg_ear = left_ear
+        elif right_ear > 0:
+            avg_ear = right_ear
+        else:
+            avg_ear = 0.0
         
         # Store in history for temporal analysis
         if session_history is None:
             session_history = deque(maxlen=30)
         
-        session_history.append(avg_ear)
+        if avg_ear > 0:
+            session_history.append(avg_ear)
         
-        # Calculate blink rate (low EAR indicates closed eyes)
-        if len(session_history) > 5:
-            recent_ears = list(session_history)[-10:]
-            blink_threshold = 0.25
-            blinks = sum(1 for ear in recent_ears if ear < blink_threshold)
-            blink_rate = blinks / len(recent_ears) if recent_ears else 0
+        # Calculate blink rate using proper blink detection algorithm
+        # Blink = EAR drops below threshold then returns
+        blink_count = 0
+        blink_threshold = 0.20  # Scientific threshold for eye closure
+        consecutive_low = 0
+        
+        if len(session_history) > 10:
+            recent_ears = list(session_history)
+            prev_ear = recent_ears[0] if recent_ears else 0.3
+            in_blink = False
+            
+            for ear in recent_ears[1:]:
+                if ear < blink_threshold and prev_ear >= blink_threshold:
+                    # Blink started
+                    in_blink = True
+                elif ear >= blink_threshold and prev_ear < blink_threshold and in_blink:
+                    # Blink completed
+                    blink_count += 1
+                    in_blink = False
+                prev_ear = ear
+            
+            # Calculate blink rate (blinks per frame, convert to per minute)
+            # Assuming ~5 FPS, 10 frames = 2 seconds
+            frames_analyzed = len(recent_ears)
+            blink_rate = (blink_count / frames_analyzed) * 5 * 60 if frames_analyzed > 0 else 0  # blinks per minute
+            blink_rate_normalized = blink_rate / 20.0  # Normal is ~15-20 blinks/min
         else:
             blink_rate = 0
+            blink_rate_normalized = 0
         
-        # Analyze eye strain indicators
-        # Normal EAR is around 0.25-0.35, lower indicates closed/tired eyes
-        # Very low blink rate (< 0.1) indicates staring (eye strain)
-        # Very high blink rate (> 0.3) indicates tiredness
+        # Analyze eye strain using scientific metrics
+        # Normal EAR: 0.25-0.30 (open eyes)
+        # Closed eyes: < 0.20
+        # Tired/droopy: 0.20-0.25
         
         strain_factors = []
+        strain_score_deduction = 0
         
-        if avg_ear < 0.2:
-            strain_factors.append("eyes_closed")
+        # EAR-based analysis
+        if avg_ear < 0.15:
+            strain_factors.append("eyes_fully_closed")
+            strain_score_deduction += 30
+        elif avg_ear < 0.20:
+            strain_factors.append("eyes_nearly_closed")
+            strain_score_deduction += 20
         elif avg_ear < 0.25:
-            strain_factors.append("eyes_tired")
+            strain_factors.append("eyes_droopy")
+            strain_score_deduction += 15
+        elif avg_ear > 0.35:
+            strain_factors.append("eyes_wide_open")
+            strain_score_deduction += 5  # Wide open can indicate strain
         
-        if blink_rate < 0.05 and len(session_history) > 10:
-            strain_factors.append("staring")
-        elif blink_rate > 0.3:
+        # Blink rate analysis (normal: 15-20 blinks/min)
+        if blink_rate_normalized < 0.3 and len(session_history) > 15:
+            strain_factors.append("infrequent_blinking")
+            strain_score_deduction += 25  # Staring at screen
+        elif blink_rate_normalized > 1.5:
             strain_factors.append("excessive_blinking")
+            strain_score_deduction += 15  # Eye irritation
         
-        # Calculate risk level
-        if len(strain_factors) >= 2:
+        # Asymmetry check (one eye more closed than other)
+        if left_ear > 0 and right_ear > 0:
+            ear_asymmetry = abs(left_ear - right_ear) / max(left_ear, right_ear)
+            if ear_asymmetry > 0.15:  # >15% difference
+                strain_factors.append("asymmetric_eye_closure")
+                strain_score_deduction += 10
+        
+        # Calculate final score (100 = perfect, deduct for issues)
+        base_score = 100
+        eye_score = base_score - strain_score_deduction
+        
+        # Determine risk level
+        if eye_score < 50:
             eye_strain_risk = "high"
-            eye_score = 40
-        elif len(strain_factors) == 1:
+        elif eye_score < 70:
             eye_strain_risk = "medium"
-            eye_score = 65
         else:
             eye_strain_risk = "low"
-            eye_score = 90
-        
-        # Adjust score based on EAR
-        if avg_ear < 0.22:
-            eye_score -= 20
-        elif avg_ear > 0.32:
-            eye_score += 5
         
         eye_score = max(0, min(100, eye_score))
         
@@ -478,8 +577,72 @@ class WellnessAnalyzer:
             "head_stability": round(1 - min(1, movement_variance * 1000), 2)
         }
     
+    def analyze_facial_expressions(self, landmarks) -> Dict:
+        """Analyze facial expressions using landmark distances and ratios"""
+        if not landmarks or len(landmarks) < 468:
+            return {}
+        
+        try:
+            # Get key facial landmarks
+            # Eyebrows
+            left_eyebrow_inner = landmarks[107]
+            right_eyebrow_inner = landmarks[336]
+            left_eyebrow_outer = landmarks[70]
+            right_eyebrow_outer = landmarks[300]
+            
+            # Eyes
+            left_eye_top = landmarks[159]
+            left_eye_bottom = landmarks[145]
+            right_eye_top = landmarks[386]
+            right_eye_bottom = landmarks[374]
+            
+            # Mouth
+            mouth_left = landmarks[61]
+            mouth_right = landmarks[291]
+            mouth_top = landmarks[13]
+            mouth_bottom = landmarks[14]
+            mouth_center_top = landmarks[12]
+            mouth_center_bottom = landmarks[15]
+            
+            # Calculate expression metrics
+            expressions = {}
+            
+            # Eyebrow position (furrowed = stress)
+            left_eyebrow_eye_dist = abs(left_eyebrow_inner.y - left_eye_top.y)
+            right_eyebrow_eye_dist = abs(right_eyebrow_inner.y - right_eye_top.y)
+            avg_eyebrow_dist = (left_eyebrow_eye_dist + right_eyebrow_eye_dist) / 2
+            expressions["eyebrow_tension"] = avg_eyebrow_dist
+            
+            # Eyebrow asymmetry (stress can cause asymmetry)
+            eyebrow_asymmetry = abs(left_eyebrow_eye_dist - right_eyebrow_eye_dist)
+            expressions["eyebrow_asymmetry"] = eyebrow_asymmetry
+            
+            # Mouth width and height (tight lips = stress)
+            mouth_width = abs(mouth_right.x - mouth_left.x)
+            mouth_height = abs(mouth_bottom.y - mouth_top.y)
+            mouth_aspect_ratio = mouth_height / mouth_width if mouth_width > 0 else 0
+            expressions["mouth_tension"] = mouth_aspect_ratio
+            
+            # Mouth corners (downward = negative emotion)
+            mouth_left_y = mouth_left.y
+            mouth_right_y = mouth_right.y
+            mouth_center_y = (mouth_center_top.y + mouth_center_bottom.y) / 2
+            mouth_droop = (mouth_left_y + mouth_right_y) / 2 - mouth_center_y
+            expressions["mouth_droop"] = mouth_droop
+            
+            # Eye opening (wide eyes = alert/stress, narrow = relaxed)
+            left_eye_opening = abs(left_eye_bottom.y - left_eye_top.y)
+            right_eye_opening = abs(right_eye_bottom.y - right_eye_top.y)
+            avg_eye_opening = (left_eye_opening + right_eye_opening) / 2
+            expressions["eye_opening"] = avg_eye_opening
+            
+            return expressions
+        except Exception as e:
+            logging.warning(f"Error analyzing facial expressions: {e}")
+            return {}
+    
     def analyze_stress(self, image, landmarks, face_detection_result) -> Dict:
-        """Improved stress analysis using facial expressions and micro-expressions"""
+        """Real stress analysis using facial expression recognition and micro-expressions"""
         # If no landmarks, estimate based on face detection
         if landmarks is None or len(landmarks) < 468:
             # Basic stress estimation based on face position and size
@@ -514,70 +677,99 @@ class WellnessAnalyzer:
                 "indicators": []
             }
         
+        # Get facial expression metrics
+        expressions = self.analyze_facial_expressions(landmarks)
+        
         stress_indicators = []
+        stress_score_deduction = 0
         
         try:
-            # 1. Analyze eyebrow position (furrowed = stress)
-            left_eyebrow = landmarks[107]  # Left eyebrow inner
-            right_eyebrow = landmarks[336]  # Right eyebrow inner
-            left_eye_top = landmarks[159]   # Left eye top
-            right_eye_top = landmarks[386]  # Right eye top
+            if expressions:
+                # 1. Eyebrow tension (furrowed = stress)
+                # Normal eyebrow-eye distance: ~0.02-0.03
+                eyebrow_tension = expressions.get("eyebrow_tension", 0.025)
+                if eyebrow_tension < 0.015:
+                    stress_indicators.append("furrowed_brows")
+                    stress_score_deduction += 20
+                elif eyebrow_tension < 0.018:
+                    stress_indicators.append("slight_brow_tension")
+                    stress_score_deduction += 10
+                
+                # Eyebrow asymmetry (stress can cause facial asymmetry)
+                eyebrow_asymmetry = expressions.get("eyebrow_asymmetry", 0)
+                if eyebrow_asymmetry > 0.005:  # Significant asymmetry
+                    stress_indicators.append("facial_asymmetry")
+                    stress_score_deduction += 8
+                
+                # 2. Mouth tension (tight/pursed = stress)
+                mouth_tension = expressions.get("mouth_tension", 0.2)
+                if mouth_tension < 0.12:  # Very tight lips
+                    stress_indicators.append("tight_mouth")
+                    stress_score_deduction += 15
+                elif mouth_tension < 0.15:
+                    stress_indicators.append("slight_mouth_tension")
+                    stress_score_deduction += 8
+                
+                # Mouth droop (downward corners = negative emotion/stress)
+                mouth_droop = expressions.get("mouth_droop", 0)
+                if mouth_droop > 0.01:  # Downward droop
+                    stress_indicators.append("mouth_droop")
+                    stress_score_deduction += 12
+                
+                # 3. Eye opening (wide eyes = alert/stress, but also can be normal)
+                eye_opening = expressions.get("eye_opening", 0.02)
+                if eye_opening > 0.035:  # Very wide eyes (alert/stress)
+                    stress_indicators.append("wide_eyes_alert")
+                    stress_score_deduction += 8
+                elif eye_opening < 0.015:  # Narrow eyes (fatigue/stress)
+                    stress_indicators.append("narrow_eyes")
+                    stress_score_deduction += 10
             
-            # Distance between eyebrow and eye (smaller = furrowed)
-            left_eyebrow_eye_dist = abs(left_eyebrow.y - left_eye_top.y)
-            right_eyebrow_eye_dist = abs(right_eyebrow.y - right_eye_top.y)
-            avg_eyebrow_dist = (left_eyebrow_eye_dist + right_eyebrow_eye_dist) / 2
+            # 4. Analyze jaw tension using landmarks
+            if landmarks and len(landmarks) >= 468:
+                jaw_left = landmarks[172]
+                jaw_right = landmarks[397]
+                jaw_center = landmarks[175]
+                
+                jaw_width = abs(jaw_right.x - jaw_left.x)
+                # Normal jaw width relative to face: ~0.18-0.22
+                # Narrower can indicate clenching
+                if jaw_width < 0.14:
+                    stress_indicators.append("jaw_tension")
+                    stress_score_deduction += 12
+                
+                # Check jaw symmetry
+                jaw_left_dist = abs(jaw_left.x - jaw_center.x)
+                jaw_right_dist = abs(jaw_right.x - jaw_center.x)
+                jaw_asymmetry = abs(jaw_left_dist - jaw_right_dist)
+                if jaw_asymmetry > 0.02:
+                    stress_indicators.append("jaw_asymmetry")
+                    stress_score_deduction += 8
             
-            if avg_eyebrow_dist < 0.015:  # Threshold for furrowed brows
-                stress_indicators.append("furrowed_brows")
+            # 5. Overall facial tension (compressed face = tension)
+            if landmarks and len(landmarks) >= 468:
+                face_width = abs(landmarks[454].x - landmarks[234].x)
+                face_height = abs(landmarks[152].y - landmarks[10].y)
+                face_ratio = face_width / face_height if face_height > 0 else 1
+                
+                # Normal face ratio: ~0.75-0.85
+                if face_ratio < 0.65:  # Compressed face (tension)
+                    stress_indicators.append("facial_tension")
+                    stress_score_deduction += 10
             
-            # 2. Analyze mouth position (tight/pursed = stress)
-            mouth_left = landmarks[61]
-            mouth_right = landmarks[291]
-            mouth_top = landmarks[13]
-            mouth_bottom = landmarks[14]
+            # Calculate final stress score (100 = no stress, deduct for indicators)
+            base_score = 100
+            stress_score = base_score - stress_score_deduction
             
-            mouth_width = abs(mouth_right.x - mouth_left.x)
-            mouth_height = abs(mouth_bottom.y - mouth_top.y)
-            mouth_ratio = mouth_height / mouth_width if mouth_width > 0 else 0
-            
-            if mouth_ratio < 0.15:  # Tight/pursed lips
-                stress_indicators.append("tight_mouth")
-            
-            # 3. Analyze jaw tension (clenched = stress)
-            jaw_left = landmarks[172]
-            jaw_right = landmarks[397]
-            jaw_center = landmarks[175]
-            
-            jaw_width = abs(jaw_right.x - jaw_left.x)
-            # Narrow jaw width can indicate clenching
-            if jaw_width < 0.15:
-                stress_indicators.append("jaw_tension")
-            
-            # 4. Overall facial tension (based on landmark distances)
-            face_width = abs(landmarks[454].x - landmarks[234].x)
-            face_height = abs(landmarks[152].y - landmarks[10].y)
-            face_ratio = face_width / face_height if face_height > 0 else 1
-            
-            # Calculate stress score
-            stress_count = len(stress_indicators)
-            
-            if stress_count >= 3:
+            # Determine stress level
+            if stress_score < 50:
                 stress_level = "high"
-                stress_score = 30
-            elif stress_count == 2:
+            elif stress_score < 70:
                 stress_level = "medium"
-                stress_score = 60
-            elif stress_count == 1:
+            elif stress_score < 85:
                 stress_level = "low-medium"
-                stress_score = 75
             else:
                 stress_level = "low"
-                stress_score = 90
-            
-            # Adjust based on facial tension
-            if face_ratio < 0.7:  # Compressed face (tension)
-                stress_score -= 10
             
             stress_score = max(0, min(100, stress_score))
             
