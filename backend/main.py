@@ -1480,27 +1480,53 @@ async def analyze_frame(request: AnalyzeRequest):
         # Analyze with comprehensive error handling
         try:
             posture = analyzer.analyze_posture(image, landmarks, face_results)
+            logging.info(f"✅ Posture analysis successful: score={posture.get('score')}, face_y={posture.get('face_position_y')}")
         except Exception as e:
-            logging.error(f"Posture analysis error: {e}", exc_info=True)
-            posture = {"slouching": False, "score": 70, "head_angle": 0, "face_position_y": 0.5, "face_position_x": 0.5}
+            logging.error(f"❌ Posture analysis error: {e}", exc_info=True)
+            # Use a more varied default based on face detection
+            if face_results is not None:
+                default_score = 65  # Lower if face detected but analysis failed
+            else:
+                default_score = 40  # Much lower if no face
+            posture = {"slouching": True, "score": default_score, "head_angle": 0, "face_position_y": 0.5, "face_position_x": 0.5, "error": str(e)}
         
         try:
             eye_strain = analyzer.analyze_eye_strain(image, landmarks, ear_history)
+            logging.info(f"✅ Eye strain analysis successful: score={eye_strain.get('score')}, EAR={eye_strain.get('ear_avg')}")
         except Exception as e:
-            logging.error(f"Eye strain analysis error: {e}", exc_info=True)
-            eye_strain = {"eye_strain_risk": "low", "score": 100, "blink_rate": 0, "ear_avg": 0.28}
+            logging.error(f"❌ Eye strain analysis error: {e}", exc_info=True)
+            # Use history if available
+            if len(ear_history) > 0:
+                avg_ear = np.mean(list(ear_history))
+                estimated_score = max(60, min(95, 80 + (avg_ear - 0.28) * 50))
+            else:
+                estimated_score = 75  # Middle ground
+            eye_strain = {"eye_strain_risk": "low", "score": estimated_score, "blink_rate": 0, "ear_avg": 0.28, "error": str(e)}
         
         try:
             engagement = analyzer.analyze_engagement(landmarks, face_results, head_position_history, image.shape)
+            logging.info(f"✅ Engagement analysis successful: score={engagement.get('score')}")
         except Exception as e:
-            logging.error(f"Engagement analysis error: {e}", exc_info=True)
-            engagement = {"concentration": "low", "score": 50, "face_visible": True, "head_stability": 0}
+            logging.error(f"❌ Engagement analysis error: {e}", exc_info=True)
+            # Estimate based on face detection and movement
+            if face_results is not None:
+                if len(head_position_history) > 5:
+                    positions = list(head_position_history)
+                    variance = np.var([p[0] for p in positions]) + np.var([p[1] for p in positions])
+                    estimated_score = max(40, min(80, 70 - variance * 1000))
+                else:
+                    estimated_score = 60
+            else:
+                estimated_score = 30
+            engagement = {"concentration": "low", "score": estimated_score, "face_visible": face_results is not None, "head_stability": 0, "error": str(e)}
         
         try:
             stress = analyzer.analyze_stress(image, landmarks, face_results)
+            logging.info(f"✅ Stress analysis successful: score={stress.get('score')}")
         except Exception as e:
-            logging.error(f"Stress analysis error: {e}", exc_info=True)
-            stress = {"stress_level": "low", "score": 100, "indicators": []}
+            logging.error(f"❌ Stress analysis error: {e}", exc_info=True)
+            # Default to moderate stress if analysis fails
+            stress = {"stress_level": "low", "score": 85, "indicators": [], "error": str(e)}
         
         # Calculate productivity
         try:
