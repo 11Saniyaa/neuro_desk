@@ -100,10 +100,77 @@ class WellnessAnalyzer:
         self.ear_std = 0.03  # Will adapt
         self.blink_state = {"left": "open", "right": "open", "consecutive_closed": 0}
         
+        # User calibration data (learns from first 30 seconds)
+        self.user_calibration = {
+            "ear_samples": deque(maxlen=100),  # Collect samples for calibration
+            "posture_samples": deque(maxlen=100),
+            "face_position_samples": deque(maxlen=100),
+            "calibrated": False,
+            "calibration_time": None
+        }
+        
         # Confidence thresholds
         self.min_face_confidence = 0.6  # Higher confidence required
         self.min_landmark_quality = 0.7  # Quality threshold for landmarks
         
+        # Real-world adjustments
+        self.lighting_adaptation = 1.0  # Adapts to lighting conditions
+        self.distance_adaptation = 1.0  # Adapts to camera distance
+    
+    def _calibrate_posture(self):
+        """Calibrate to user's normal posture position"""
+        if len(self.user_calibration["posture_samples"]) < 30:
+            return
+        
+        samples = list(self.user_calibration["posture_samples"])
+        avg_face_y = np.mean([s["face_y"] for s in samples])
+        avg_face_x = np.mean([s["face_x"] for s in samples])
+        avg_pitch = np.mean([abs(s["pitch"]) for s in samples])
+        
+        # Store user's baseline
+        self.user_calibration["baseline_face_y"] = avg_face_y
+        self.user_calibration["baseline_face_x"] = avg_face_x
+        self.user_calibration["baseline_pitch"] = avg_pitch
+        self.user_calibration["calibrated"] = True
+        self.user_calibration["calibration_time"] = datetime.now()
+        
+        logging.info(f"User posture calibrated: face_y={avg_face_y:.3f}, face_x={avg_face_x:.3f}, pitch={avg_pitch:.2f}")
+    
+    def _calibrate_ear(self):
+        """Calibrate to user's normal EAR"""
+        if len(self.user_calibration["ear_samples"]) < 50:
+            return
+        
+        samples = list(self.user_calibration["ear_samples"])
+        self.ear_baseline = np.mean(samples)
+        self.ear_std = np.std(samples)
+        logging.info(f"User EAR calibrated: baseline={self.ear_baseline:.3f}, std={self.ear_std:.3f}")
+    
+    def _get_adaptive_posture_threshold(self, face_center_y):
+        """Get adaptive threshold based on user's calibrated baseline"""
+        if not self.user_calibration["calibrated"]:
+            # Use default range
+            return (0.28, 0.42)
+        
+        baseline_y = self.user_calibration["baseline_face_y"]
+        # Allow ±15% deviation from baseline
+        threshold_range = 0.15
+        return (baseline_y - threshold_range, baseline_y + threshold_range)
+        
+    def _adapt_to_lighting(self, image: np.ndarray):
+        """Adapt analysis to current lighting conditions"""
+        # Calculate average brightness
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if len(image.shape) == 3 else image
+        avg_brightness = np.mean(gray) / 255.0
+        
+        # Adjust adaptation factor (0.5 = dark, 1.0 = normal, 1.5 = bright)
+        if avg_brightness < 0.3:
+            self.lighting_adaptation = 0.7  # Dark - be more lenient
+        elif avg_brightness > 0.7:
+            self.lighting_adaptation = 1.2  # Bright - can be more strict
+        else:
+            self.lighting_adaptation = 1.0  # Normal
+    
     def validate_image_quality(self, image: np.ndarray) -> Dict:
         """Validate image quality before processing"""
         try:
@@ -340,6 +407,18 @@ class WellnessAnalyzer:
         if not face_detected or face_center_x is None or face_center_y is None:
             return {"slouching": True, "score": 35, "head_angle": 0, "face_position_y": 0.5, "face_position_x": 0.5, "reason": "no_face_detected"}
         
+        # Store calibration data for learning user's normal posture
+        if not self.user_calibration["calibrated"]:
+            self.user_calibration["posture_samples"].append({
+                "face_y": face_center_y,
+                "face_x": face_center_x,
+                "pitch": head_pose.get("pitch", 0),
+                "roll": head_pose.get("roll", 0)
+            })
+            # Calibrate after 30 samples (about 10 seconds at 3 FPS)
+            if len(self.user_calibration["posture_samples"]) >= 30:
+                self._calibrate_posture()
+        
         # Analyze posture based on multiple factors with more sensitivity
         # 1. Head pitch (forward lean = slouching) - only if we have pose data
         if landmarks and len(landmarks) >= 468 and head_pose.get("confidence", 0) > 0.5:
@@ -354,21 +433,30 @@ class WellnessAnalyzer:
             pitch_estimate = y_deviation * 60  # More sensitive conversion
             pitch_score = 100 - min(90, abs(pitch_estimate) * 2.0)  # More sensitive (was 1.5)
         
-        # 2. Face vertical position (should be in upper portion for good posture)
-        # Ideal position is around 0.3-0.4 (upper third to middle-upper)
-        ideal_y_range = (0.28, 0.42)  # Slightly tighter range
+        # 2. Face vertical position (adaptive based on user calibration)
+        ideal_y_range = self._get_adaptive_posture_threshold(face_center_y)
+        baseline_y = self.user_calibration.get("baseline_face_y", 0.35) if self.user_calibration["calibrated"] else 0.35
+        
         if face_center_y < ideal_y_range[0]:
             # Too high (unlikely but possible)
-            vertical_penalty = (ideal_y_range[0] - face_center_y) * 80
-            vertical_score = 100 - min(30, vertical_penalty)
+            vertical_penalty = (ideal_y_range[0] - face_center_y) * 100
+            vertical_score = 100 - min(35, vertical_penalty)
         elif face_center_y > ideal_y_range[1]:
-            # Too low (slouching)
-            vertical_penalty = (face_center_y - ideal_y_range[1]) * 200  # More sensitive (was 150)
-            vertical_score = 100 - min(85, vertical_penalty)
+            # Too low (slouching) - more sensitive if calibrated
+            deviation = face_center_y - ideal_y_range[1]
+            penalty_multiplier = 250 if self.user_calibration["calibrated"] else 200
+            vertical_penalty = deviation * penalty_multiplier
+            vertical_score = 100 - min(90, vertical_penalty)
         else:
-            # In ideal range - calculate score based on how centered
-            center_distance = abs(face_center_y - 0.35)  # Distance from perfect center
-            vertical_score = 100 - (center_distance * 50)  # Small penalty for not perfect
+            # In ideal range - calculate score based on distance from user's baseline
+            if self.user_calibration["calibrated"]:
+                # Use user's baseline as perfect position
+                center_distance = abs(face_center_y - baseline_y)
+                vertical_score = 100 - (center_distance * 60)
+            else:
+                # Use default center
+                center_distance = abs(face_center_y - 0.35)
+                vertical_score = 100 - (center_distance * 50)
         
         # 3. Head tilt (sideways lean) - more sensitive
         if landmarks and len(landmarks) >= 468 and head_pose.get("confidence", 0) > 0.5:
@@ -482,11 +570,26 @@ class WellnessAnalyzer:
             session_history = deque(maxlen=30)
         
         if avg_ear > 0:
+            # Collect calibration samples
+            if not self.user_calibration["calibrated"]:
+                self.user_calibration["ear_samples"].append(avg_ear)
+                # Calibrate after 50 samples
+                if len(self.user_calibration["ear_samples"]) >= 50:
+                    self._calibrate_ear()
+            
             # Adaptive baseline: update baseline if we have enough history
             if len(session_history) > 10:
                 recent_ears = list(session_history)[-10:]
-                self.ear_baseline = np.mean(recent_ears)
-                self.ear_std = np.std(recent_ears)
+                # Use calibrated baseline if available, otherwise adapt
+                if self.user_calibration["calibrated"]:
+                    # Slowly adapt to changes (learning rate)
+                    learning_rate = 0.1
+                    new_baseline = np.mean(recent_ears)
+                    self.ear_baseline = (1 - learning_rate) * self.ear_baseline + learning_rate * new_baseline
+                    self.ear_std = np.std(recent_ears)
+                else:
+                    self.ear_baseline = np.mean(recent_ears)
+                    self.ear_std = np.std(recent_ears)
             
             # Weighted smoothing: recent frames have more weight
             if len(session_history) > 0:
@@ -499,8 +602,13 @@ class WellnessAnalyzer:
                 session_history.append(avg_ear)
         
         # Improved blink detection with adaptive threshold
-        # Use adaptive threshold based on user's baseline
-        adaptive_blink_threshold = max(0.15, self.ear_baseline - 2 * self.ear_std) if self.ear_std > 0 else 0.20
+        # Use adaptive threshold based on user's baseline (more accurate if calibrated)
+        if self.user_calibration["calibrated"]:
+            # Use calibrated baseline for more accurate blink detection
+            adaptive_blink_threshold = max(0.15, self.ear_baseline - 2.5 * self.ear_std) if self.ear_std > 0 else 0.20
+        else:
+            # Use standard threshold until calibrated
+            adaptive_blink_threshold = max(0.15, self.ear_baseline - 2 * self.ear_std) if self.ear_std > 0 else 0.20
         blink_count = 0
         
         if len(session_history) > 15:
@@ -543,23 +651,35 @@ class WellnessAnalyzer:
         strain_factors = []
         strain_score_deduction = 0
         
-        # EAR-based analysis using adaptive thresholds
-        ear_deviation = abs(avg_ear - self.ear_baseline) if self.ear_baseline > 0 else abs(avg_ear - 0.28)
+        # EAR-based analysis using adaptive thresholds (more accurate if calibrated)
+        if self.user_calibration["calibrated"]:
+            # Use calibrated baseline for personalized analysis
+            ear_deviation = abs(avg_ear - self.ear_baseline)
+            # Use user-specific thresholds
+            closed_threshold = self.ear_baseline - 2.5 * self.ear_std
+            droopy_threshold = self.ear_baseline - 1.5 * self.ear_std
+            wide_threshold = self.ear_baseline + 2 * self.ear_std
+        else:
+            # Use standard thresholds
+            ear_deviation = abs(avg_ear - 0.28)
+            closed_threshold = 0.20
+            droopy_threshold = 0.25
+            wide_threshold = 0.38
         
-        if avg_ear < 0.15:
+        if avg_ear < closed_threshold:
             strain_factors.append("eyes_fully_closed")
             strain_score_deduction += 35
-        elif avg_ear < 0.20:
+        elif avg_ear < droopy_threshold:
             strain_factors.append("eyes_nearly_closed")
             strain_score_deduction += 25
-        elif avg_ear < 0.25:
+        elif avg_ear < (self.ear_baseline - 0.5 * self.ear_std) if self.user_calibration["calibrated"] else 0.25:
             strain_factors.append("eyes_droopy")
             strain_score_deduction += 18
-        elif avg_ear > 0.38:
+        elif avg_ear > wide_threshold:
             strain_factors.append("eyes_wide_open")
             strain_score_deduction += 8  # Wide open can indicate strain
-        elif ear_deviation > 2 * self.ear_std and self.ear_std > 0:
-            # Significant deviation from baseline
+        elif ear_deviation > 2 * self.ear_std and self.ear_std > 0 and self.user_calibration["calibrated"]:
+            # Significant deviation from baseline (only if calibrated)
             if avg_ear < self.ear_baseline:
                 strain_factors.append("eyes_below_baseline")
                 strain_score_deduction += 12
@@ -842,7 +962,7 @@ class WellnessAnalyzer:
                     stress_score = 85
                     stress_level = "low"
             else:
-                stress_score = 85
+                stress_score = 80  # Lower if no face
                 stress_level = "low"
             
             return {
@@ -1317,6 +1437,9 @@ async def analyze_frame(request: AnalyzeRequest):
         
         ear_history, head_position_history = get_session_history(session_id)
         
+        # Adapt to current conditions
+        analyzer._adapt_to_lighting(image)
+        
         # Analyze
         try:
             posture = analyzer.analyze_posture(image, landmarks, face_results)
@@ -1487,6 +1610,9 @@ async def websocket_endpoint(websocket: WebSocket):
             sessions[session_id]["frame_count"] = frame_count + 1
             
             ear_history, head_position_history = get_session_history(session_id)
+            
+            # Adapt to current conditions
+            analyzer._adapt_to_lighting(image)
             
             # Analyze
             posture = analyzer.analyze_posture(image, landmarks, face_results)
