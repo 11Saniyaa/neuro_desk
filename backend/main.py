@@ -988,12 +988,12 @@ class WellnessAnalyzer:
                         stress_level = "low-medium"
                     elif abs(face_center_x - 0.5) > 0.2:  # Off-center
                         stress_score = 80
-        stress_level = "low"
+                        stress_level = "low"
                     else:
                         stress_score = 90
                         stress_level = "low"
                 else:
-        stress_score = 85
+                    stress_score = 85
                     stress_level = "low"
             else:
                 stress_score = 80  # Lower if no face
