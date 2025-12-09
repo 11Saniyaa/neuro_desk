@@ -567,9 +567,9 @@ class WellnessAnalyzer:
                 eye_strain_risk = "low"
             
             eye_score = max(45, min(95, base_score))
-            
-            return {
-                "eye_strain_risk": eye_strain_risk,
+        
+        return {
+            "eye_strain_risk": eye_strain_risk,
                 "score": round(eye_score, 2),
                 "blink_rate": round(blink_rate, 3),
                 "ear_avg": round(avg_ear, 3)
@@ -988,19 +988,19 @@ class WellnessAnalyzer:
                         stress_level = "low-medium"
                     elif abs(face_center_x - 0.5) > 0.2:  # Off-center
                         stress_score = 80
-                        stress_level = "low"
+        stress_level = "low"
                     else:
                         stress_score = 90
                         stress_level = "low"
                 else:
-                    stress_score = 85
+        stress_score = 85
                     stress_level = "low"
             else:
                 stress_score = 80  # Lower if no face
                 stress_level = "low"
-            
-            return {
-                "stress_level": stress_level,
+        
+        return {
+            "stress_level": stress_level,
                 "score": round(stress_score, 2),
                 "indicators": []
             }
@@ -1113,52 +1113,83 @@ class WellnessAnalyzer:
         }
     
     def calculate_productivity_score(self, posture, eye_strain, engagement, stress) -> Dict:
-        """Calculate overall productivity score"""
-        weights = {
-            "posture": 0.25,
-            "eye_strain": 0.20,
-            "engagement": 0.30,
-            "stress": 0.25
-        }
-        
-        productivity = (
-            posture["score"] * weights["posture"] +
-            eye_strain["score"] * weights["eye_strain"] +
-            engagement["score"] * weights["engagement"] +
-            stress["score"] * weights["stress"]
-        )
-        
-        return {
-            "productivity_score": round(productivity, 2),
-            "break_needed": productivity < 60,
-            "eye_exercise_needed": eye_strain["eye_strain_risk"] in ["medium", "high"],
-            "posture_reminder": posture["slouching"]
-        }
+        """Calculate overall productivity score with error handling"""
+        try:
+            weights = {
+                "posture": 0.25,
+                "eye_strain": 0.20,
+                "engagement": 0.30,
+                "stress": 0.25
+            }
+            
+            # Safely get scores with defaults
+            posture_score = posture.get("score", 70) if posture else 70
+            eye_strain_score = eye_strain.get("score", 100) if eye_strain else 100
+            engagement_score = engagement.get("score", 50) if engagement else 50
+            stress_score = stress.get("score", 100) if stress else 100
+            
+            productivity = (
+                posture_score * weights["posture"] +
+                eye_strain_score * weights["eye_strain"] +
+                engagement_score * weights["engagement"] +
+                stress_score * weights["stress"]
+            )
+            
+            # Safely get risk levels
+            eye_strain_risk = eye_strain.get("eye_strain_risk", "low") if eye_strain else "low"
+            is_slouching = posture.get("slouching", False) if posture else False
+            
+            return {
+                "productivity_score": round(productivity, 2),
+                "break_needed": productivity < 60,
+                "eye_exercise_needed": eye_strain_risk in ["medium", "high"],
+                "posture_reminder": is_slouching
+            }
+        except Exception as e:
+            logging.error(f"Error calculating productivity score: {e}", exc_info=True)
+            return {
+                "productivity_score": 70.0,
+                "break_needed": False,
+                "eye_exercise_needed": False,
+                "posture_reminder": False
+            }
     
     def get_recommendations(self, analysis: Dict) -> list:
-        """Generate wellness recommendations"""
-        recommendations = []
-        
-        if analysis["posture_reminder"]:
-            recommendations.append("💺 Sit up straight! Adjust your posture")
-        
-        if analysis["eye_exercise_needed"]:
-            if analysis.get("blink_rate", 0) < 0.05:
-                recommendations.append("👁️ Blink more often! Take a 20-20-20 break: Look 20ft away for 20 seconds")
-            else:
-                recommendations.append("👁️ Take a 20-20-20 break: Look 20ft away for 20 seconds")
-        
-        if analysis["break_needed"]:
-            recommendations.append("☕ Take a 5-minute micro-break")
-        
-        stress_level = analysis.get("stress_level", "low")
-        if stress_level in ["medium", "high", "low-medium"]:
-            recommendations.append("🧘 Take 3 deep breaths to reduce stress")
-        
-        if not recommendations:
-            recommendations.append("✅ You're doing great! Keep it up")
-        
-        return recommendations
+        """Generate wellness recommendations with error handling"""
+        try:
+            recommendations = []
+            
+            if not analysis:
+                return ["⚠️ No analysis data available"]
+            
+            # Safely check posture reminder
+            if analysis.get("posture_reminder", False):
+                recommendations.append("💺 Sit up straight! Adjust your posture")
+            
+            # Safely check eye exercise needed
+            if analysis.get("eye_exercise_needed", False):
+                blink_rate = analysis.get("blink_rate", 0)
+                if blink_rate < 0.05:
+                    recommendations.append("👁️ Blink more often! Take a 20-20-20 break: Look 20ft away for 20 seconds")
+                else:
+                    recommendations.append("👁️ Take a 20-20-20 break: Look 20ft away for 20 seconds")
+            
+            # Safely check break needed
+            if analysis.get("break_needed", False):
+                recommendations.append("☕ Take a 5-minute micro-break")
+            
+            # Safely check stress level
+            stress_level = analysis.get("stress_level", "low")
+            if stress_level in ["medium", "high", "low-medium"]:
+                recommendations.append("🧘 Take 3 deep breaths to reduce stress")
+            
+            if not recommendations:
+                recommendations.append("✅ You're doing great! Keep it up")
+            
+            return recommendations
+        except Exception as e:
+            logging.error(f"Error generating recommendations: {e}", exc_info=True)
+            return ["⚠️ Error generating recommendations"]
 
 analyzer = WellnessAnalyzer()
 
@@ -1527,15 +1558,15 @@ async def analyze_frame(request: AnalyzeRequest):
             logging.error(f"❌ Stress analysis error: {e}", exc_info=True)
             # Default to moderate stress if analysis fails
             stress = {"stress_level": "low", "score": 85, "indicators": [], "error": str(e)}
-        
-        # Calculate productivity
+            
+            # Calculate productivity
         try:
             productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
         except Exception as e:
             logging.error(f"Productivity calculation error: {e}", exc_info=True)
             productivity = {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False}
-        
-        # Get recommendations
+            
+            # Get recommendations
         try:
             recommendations = analyzer.get_recommendations({
                 **productivity,
@@ -1735,18 +1766,18 @@ async def websocket_endpoint(websocket: WebSocket):
             
             # Calculate productivity
             try:
-                productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
+            productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
             except Exception as e:
                 logging.error(f"Productivity calculation error: {e}", exc_info=True)
                 productivity = {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False}
             
             # Get recommendations
             try:
-                recommendations = analyzer.get_recommendations({
-                    **productivity,
+            recommendations = analyzer.get_recommendations({
+                **productivity,
                     "stress_level": stress.get("stress_level", "low"),
                     "blink_rate": eye_strain.get("blink_rate", 0)
-                })
+            })
             except Exception as e:
                 logging.error(f"Recommendations error: {e}", exc_info=True)
                 recommendations = []
