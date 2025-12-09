@@ -1773,11 +1773,11 @@ async def websocket_endpoint(websocket: WebSocket):
             
             # Get recommendations
             try:
-            recommendations = analyzer.get_recommendations({
-                **productivity,
+                recommendations = analyzer.get_recommendations({
+                    **productivity,
                     "stress_level": stress.get("stress_level", "low"),
                     "blink_rate": eye_strain.get("blink_rate", 0)
-            })
+                })
             except Exception as e:
                 logging.error(f"Recommendations error: {e}", exc_info=True)
                 recommendations = []
