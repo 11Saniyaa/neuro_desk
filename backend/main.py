@@ -1766,7 +1766,7 @@ async def websocket_endpoint(websocket: WebSocket):
             
             # Calculate productivity
             try:
-            productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
+                productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
             except Exception as e:
                 logging.error(f"Productivity calculation error: {e}", exc_info=True)
                 productivity = {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False}
