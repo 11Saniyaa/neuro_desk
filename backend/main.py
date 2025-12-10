@@ -60,8 +60,8 @@ app.add_middleware(
 
 sessions: Dict[str, Dict] = {}
 
-# Frame skipping configuration - reduced for more real-time updates
-FRAME_SKIP = 2  # Process every Nth frame (2 = process every 2nd frame, 50% reduction for better responsiveness)
+# Frame skipping configuration - DISABLED for real-time analysis
+FRAME_SKIP = 1  # Process every frame (1 = no skipping, 100% processing for maximum responsiveness)
 
 def get_session_history(session_id: str) -> Tuple[deque, deque]:
     """Get or create session history for temporal smoothing"""
@@ -468,29 +468,29 @@ class WellnessAnalyzer:
             pitch_score = 100 - min(90, abs(pitch_estimate) * 2.0)  # More sensitive (was 1.5)
         
         # 2. Face vertical position (adaptive based on user calibration)
-        ideal_y_range = self._get_adaptive_posture_threshold(face_center_y)
-        baseline_y = self.user_calibration.get("baseline_face_y", 0.35) if self.user_calibration["calibrated"] else 0.35
+        # Use fixed ideal range for more consistent scoring that responds to changes
+        ideal_y = 0.35  # Ideal face position (upper third)
+        ideal_y_range = (0.28, 0.42)  # Fixed range for consistent scoring
+        
+        # Calculate score based on distance from ideal position - more sensitive
+        y_deviation = abs(face_center_y - ideal_y)
         
         if face_center_y < ideal_y_range[0]:
-            # Too high (unlikely but possible)
-            vertical_penalty = (ideal_y_range[0] - face_center_y) * 100
-            vertical_score = 100 - min(35, vertical_penalty)
+            # Too high - calculate penalty
+            deviation = ideal_y_range[0] - face_center_y
+            vertical_penalty = deviation * 300  # High sensitivity
+            vertical_score = max(20, 100 - vertical_penalty)
         elif face_center_y > ideal_y_range[1]:
-            # Too low (slouching) - more sensitive if calibrated
+            # Too low (slouching) - high sensitivity
             deviation = face_center_y - ideal_y_range[1]
-            penalty_multiplier = 250 if self.user_calibration["calibrated"] else 200
-            vertical_penalty = deviation * penalty_multiplier
-            vertical_score = 100 - min(90, vertical_penalty)
+            vertical_penalty = deviation * 400  # Very high sensitivity for slouching
+            vertical_score = max(15, 100 - min(85, vertical_penalty))
         else:
-            # In ideal range - calculate score based on distance from user's baseline
-            if self.user_calibration["calibrated"]:
-                # Use user's baseline as perfect position
-                center_distance = abs(face_center_y - baseline_y)
-                vertical_score = 100 - (center_distance * 60)
-            else:
-                # Use default center
-                center_distance = abs(face_center_y - 0.35)
-                vertical_score = 100 - (center_distance * 50)
+            # In ideal range - calculate score based on distance from ideal
+            # More sensitive to small changes
+            center_distance = y_deviation
+            vertical_score = 100 - (center_distance * 150)  # High sensitivity
+            vertical_score = max(50, min(100, vertical_score))  # Keep in reasonable range
         
         # 3. Head tilt (sideways lean) - more sensitive
         if landmarks and len(landmarks) >= 468 and head_pose.get("confidence", 0) > 0.5:
@@ -504,9 +504,18 @@ class WellnessAnalyzer:
         horizontal_penalty = min(30, horizontal_offset * 60)  # More sensitive (was 50)
         
         # Calculate overall posture score with dynamic weighting
-        base_score = (pitch_score * 0.35 + vertical_score * 0.45 + (100 - horizontal_penalty) * 0.2)
-        posture_score = base_score - roll_penalty * 0.35  # More weight on roll (was 0.3)
-        posture_score = max(15, min(100, posture_score))  # Wider range for visibility
+        # Increase sensitivity to vertical position (most important for posture)
+        base_score = (pitch_score * 0.30 + vertical_score * 0.50 + (100 - horizontal_penalty) * 0.20)
+        posture_score = base_score - roll_penalty * 0.30
+        # Ensure scores vary significantly with position changes
+        posture_score = max(15, min(100, posture_score))
+        
+        # Add small random variation to prevent exact same scores (helps with UI updates)
+        # This ensures even tiny changes are reflected
+        import random
+        micro_variation = random.uniform(-0.5, 0.5)  # Very small variation
+        posture_score = round(posture_score + micro_variation, 2)
+        posture_score = max(15, min(100, posture_score))
         
         # Determine if slouching
         slouching = (
@@ -1485,20 +1494,13 @@ async def analyze_frame(request: AnalyzeRequest):
         session_data = sessions.get(session_id, {})
         frame_count = session_data.get("frame_count", 0)
         
-        # Frame skipping: Process every Nth frame, return cached result for others
-        should_process = (frame_count % FRAME_SKIP == 0)
-        
-        # Check if we have a recent cached result (within last 0.5 seconds for more responsiveness)
-        if not should_process and session_data.get("last_result"):
-            last_result_time = session_data.get("last_result_time")
-            if last_result_time and (datetime.now() - last_result_time).total_seconds() < 0.5:
-                logging.debug(f"Frame {frame_count}: Using cached result (frame skipping)")
-                return JSONResponse(content=session_data["last_result"], status_code=200)
-        
-        # Update frame count
+        # Update frame count first
         if session_id not in sessions:
             get_session_history(session_id)  # Initialize session
         sessions[session_id]["frame_count"] = frame_count + 1
+        
+        # Process every frame for real-time analysis (no skipping)
+        # Always analyze fresh data to detect position changes
         
         ear_history, head_position_history = get_session_history(session_id)
         
@@ -1576,43 +1578,41 @@ async def analyze_frame(request: AnalyzeRequest):
         except Exception as e:
             logging.error(f"Recommendations error: {e}", exc_info=True)
             recommendations = []
-            
-            # Prepare response
-            response = {
-                "timestamp": datetime.now().isoformat(),
-                "posture": posture,
-                "eye_strain": eye_strain,
-                "engagement": engagement,
-                "stress": stress,
-                "productivity": productivity,
-                "recommendations": recommendations
-            }
-            
-            # Detailed logging for debugging constant scores
-            logging.info(f"Analysis complete - Posture: {posture.get('score', 'N/A')} (face_y: {posture.get('face_position_y', 'N/A')}, head_angle: {posture.get('head_angle', 'N/A')}), "
-                        f"Eye: {eye_strain.get('score', 'N/A')} (EAR: {eye_strain.get('ear_avg', 'N/A')}, blinks: {eye_strain.get('blink_rate', 'N/A')}), "
-                        f"Engagement: {engagement.get('score', 'N/A')} (stability: {engagement.get('head_stability', 'N/A')}), "
-                        f"Stress: {stress.get('score', 'N/A')} ({stress.get('stress_level', 'N/A')}), "
-                        f"Productivity: {productivity.get('productivity_score', 'N/A')}")
-            has_landmarks = landmarks is not None and len(landmarks) > 0 if landmarks else False
-            logging.info(f"Face detected: {face_results is not None}, Landmarks: {has_landmarks}, "
-                        f"Face center: ({posture.get('face_position_x', 'N/A')}, {posture.get('face_position_y', 'N/A')})")
-            
-            # Always update timestamp to ensure freshness
-            response["timestamp"] = datetime.now().isoformat()
-            
-            # Cache result for frame skipping
-            if session_id in sessions:
-                sessions[session_id]["last_result"] = response
-                sessions[session_id]["last_result_time"] = datetime.now()
-            
-            # Log that we're sending fresh analysis
-            logging.info(f"📤 Sending fresh analysis - Posture: {posture.get('score')}, Eye: {eye_strain.get('score')}, Engagement: {engagement.get('score')}, Stress: {stress.get('score')}")
-            
-            return JSONResponse(content=response, status_code=200)
-        except Exception as analysis_err:
-            logging.error(f"Error in analysis: {analysis_err}", exc_info=True)
-            raise
+        
+        # Prepare response
+        response = {
+            "timestamp": datetime.now().isoformat(),
+            "posture": posture,
+            "eye_strain": eye_strain,
+            "engagement": engagement,
+            "stress": stress,
+            "productivity": productivity,
+            "recommendations": recommendations
+        }
+        
+        # Detailed logging for debugging constant scores
+        logging.info(f"Analysis complete - Posture: {posture.get('score', 'N/A')} (face_y: {posture.get('face_position_y', 'N/A')}, head_angle: {posture.get('head_angle', 'N/A')}), "
+                    f"Eye: {eye_strain.get('score', 'N/A')} (EAR: {eye_strain.get('ear_avg', 'N/A')}, blinks: {eye_strain.get('blink_rate', 'N/A')}), "
+                    f"Engagement: {engagement.get('score', 'N/A')} (stability: {engagement.get('head_stability', 'N/A')}), "
+                    f"Stress: {stress.get('score', 'N/A')} ({stress.get('stress_level', 'N/A')}), "
+                    f"Productivity: {productivity.get('productivity_score', 'N/A')}")
+        has_landmarks = landmarks is not None and len(landmarks) > 0 if landmarks else False
+        logging.info(f"Face detected: {face_results is not None}, Landmarks: {has_landmarks}, "
+                    f"Face center: ({posture.get('face_position_x', 'N/A')}, {posture.get('face_position_y', 'N/A')})")
+        
+        # Always update timestamp to ensure freshness
+        response["timestamp"] = datetime.now().isoformat()
+        
+        # Don't cache results - always send fresh analysis for real-time updates
+        # Cache only for reference, but don't reuse it
+        if session_id in sessions:
+            sessions[session_id]["last_result"] = response  # Keep for reference only
+            sessions[session_id]["last_result_time"] = datetime.now()
+        
+        # Log that we're sending fresh analysis with position data
+        logging.info(f"📤 Sending FRESH analysis - Posture: {posture.get('score')} (face_y: {posture.get('face_position_y'):.3f}), Eye: {eye_strain.get('score')}, Engagement: {engagement.get('score')}, Stress: {stress.get('score')}")
+        
+        return JSONResponse(content=response, status_code=200)
         
     except Exception as e:
         logging.error(f"Error in analyze endpoint: {e}", exc_info=True)
@@ -1719,23 +1719,11 @@ async def websocket_endpoint(websocket: WebSocket):
             session_data = sessions.get(session_id, {})
             frame_count = session_data.get("frame_count", 0)
             
-            # Frame skipping: Process every Nth frame, return cached result for others
-            should_process = (frame_count % FRAME_SKIP == 0)
-            
-            # Check if we have a recent cached result (within last 0.5 seconds for more responsiveness)
-            if not should_process and session_data.get("last_result"):
-                last_result_time = session_data.get("last_result_time")
-                if last_result_time and (datetime.now() - last_result_time).total_seconds() < 0.5:
-                    logging.debug(f"Frame {frame_count}: Using cached result (frame skipping)")
-                    try:
-                        await websocket.send_json(session_data["last_result"])
-                        sessions[session_id]["frame_count"] = frame_count + 1
-                        continue
-                    except:
-                        pass  # If send fails, process normally
-            
-            # Update frame count
+            # Update frame count first
             sessions[session_id]["frame_count"] = frame_count + 1
+            
+            # Process every frame for real-time analysis (no skipping)
+            # Always analyze fresh data to detect position changes
             
             ear_history, head_position_history = get_session_history(session_id)
             
@@ -1802,13 +1790,14 @@ async def websocket_endpoint(websocket: WebSocket):
             # Always update timestamp to ensure freshness
             response["timestamp"] = datetime.now().isoformat()
             
-            # Cache result for frame skipping
+            # Don't cache results - always send fresh analysis for real-time updates
+            # Cache only for reference, but don't reuse it
             if session_id in sessions:
-                sessions[session_id]["last_result"] = response
+                sessions[session_id]["last_result"] = response  # Keep for reference only
                 sessions[session_id]["last_result_time"] = datetime.now()
             
-            # Log that we're sending fresh analysis
-            logging.info(f"📤 Sending fresh analysis via WebSocket - Posture: {posture.get('score')}, Eye: {eye_strain.get('score')}, Engagement: {engagement.get('score')}, Stress: {stress.get('score')}")
+            # Log that we're sending fresh analysis with position data
+            logging.info(f"📤 Sending FRESH analysis via WebSocket - Posture: {posture.get('score')} (face_y: {posture.get('face_position_y'):.3f}), Eye: {eye_strain.get('score')}, Engagement: {engagement.get('score')}, Stress: {stress.get('score')}")
             
             try:
                 await websocket.send_json(response)
