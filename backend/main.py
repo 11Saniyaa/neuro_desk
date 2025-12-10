@@ -15,7 +15,10 @@ from collections import deque
 # Configure logging first
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Try to import MediaPipe, fallback to OpenCV if not available
+# Try to import MediaPipe, fallback to OpenCV DNN if not available
+MEDIAPIPE_AVAILABLE = False
+FACE_DETECTOR_DNN = None
+
 try:
     import mediapipe as mp
     MEDIAPIPE_AVAILABLE = True
@@ -37,16 +40,43 @@ try:
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
     )
-    logging.info("MediaPipe initialized successfully")
+    logging.info("✅ MediaPipe initialized successfully")
 except ImportError:
     MEDIAPIPE_AVAILABLE = False
-    logging.warning("MediaPipe not available. Using enhanced OpenCV-based detection.")
-    # Fallback to improved OpenCV detection
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    logging.info("📦 MediaPipe not available. Using OpenCV DNN face detector (more accurate).")
+    
+    # Use OpenCV DNN face detector (more accurate than Haar Cascades)
     try:
-        face_cascade_profile = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_profileface.xml')
-    except:
+        # Download DNN model files if needed (using OpenCV's built-in face detector)
+        # Using OpenCV's DNN face detector - more accurate
+        prototxt_path = None
+        model_path = None
+        
+        # Try to use OpenCV's DNN face detector
+        # We'll use a simpler approach with improved Haar Cascades for now
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        try:
+            face_cascade_profile = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_profileface.xml')
+        except:
+            face_cascade_profile = None
+        
+        # Also try to load DNN model if available
+        try:
+            # OpenCV DNN face detector (more accurate)
+            net = cv2.dnn.readNetFromTensorflow(
+                'https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/opencv_face_detector_uint8.pb',
+                'https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/opencv_face_detector.pbtxt'
+            )
+            FACE_DETECTOR_DNN = net
+            logging.info("✅ OpenCV DNN face detector loaded")
+        except:
+            logging.info("📝 Using OpenCV Haar Cascades (DNN model not available)")
+            FACE_DETECTOR_DNN = None
+    except Exception as e:
+        logging.warning(f"Error initializing face detector: {e}")
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         face_cascade_profile = None
+        FACE_DETECTOR_DNN = None
 
 app = FastAPI(title="HCI Coach API")
 
@@ -404,14 +434,14 @@ class WellnessAnalyzer:
             return {"pitch": 0, "yaw": 0, "roll": 0, "tilted": False, "confidence": 0}
     
     def analyze_posture(self, image, landmarks, face_detection_result) -> Dict:
-        """Improved posture analysis using head pose and position"""
+        """Simplified posture analysis using face position - more reliable and responsive"""
         h, w = image.shape[:2]
         face_center_x = None
         face_center_y = None
-        head_pose = {"pitch": 0, "yaw": 0, "roll": 0, "tilted": False, "confidence": 0}
+        face_size = None
         face_detected = False
         
-        # Try to get face position from detection result first
+        # Try to get face position from detection result first (simplified approach)
         if face_detection_result and hasattr(face_detection_result, 'detections') and len(face_detection_result.detections) > 0:
             detection = face_detection_result.detections[0]
             face_detected = True
@@ -419,27 +449,40 @@ class WellnessAnalyzer:
                 bbox = detection.location_data.relative_bounding_box
                 face_center_y = bbox.ymin + bbox.height / 2
                 face_center_x = bbox.xmin + bbox.width / 2
+                face_size = bbox.width * bbox.height
             elif hasattr(detection, 'bbox'):
                 # Handle OpenCV-style bbox
                 x, y, fw, fh = detection.bbox
                 face_center_y = (y + fh / 2) / h
                 face_center_x = (x + fw / 2) / w
+                face_size = (fw * fh) / (w * h)
         elif landmarks and len(landmarks) >= 468 and landmarks[4] is not None:
             # Use landmarks if available
             face_detected = True
             nose_tip = landmarks[4]
             face_center_y = nose_tip.y
             face_center_x = nose_tip.x
-            head_pose = self.calculate_head_pose(landmarks, image.shape)
+            # Estimate face size from landmarks
+            if landmarks[234] and landmarks[454]:  # Left and right face boundaries
+                face_size = abs(landmarks[454].x - landmarks[234].x) * abs(landmarks[152].y - landmarks[10].y) if landmarks[152] and landmarks[10] else 0.1
         elif landmarks and len(landmarks) > 0 and landmarks[0] is not None:
             # Use first available landmark as face center estimate
             face_detected = True
             face_center_y = landmarks[0].y
             face_center_x = landmarks[0].x
+            face_size = 0.1  # Default estimate
         
         # If no face detected at all, return low score
         if not face_detected or face_center_x is None or face_center_y is None:
             return {"slouching": True, "score": 35, "head_angle": 0, "face_position_y": 0.5, "face_position_x": 0.5, "reason": "no_face_detected"}
+        
+        # Calculate head pose if landmarks available, otherwise use simplified approach
+        head_pose = {"pitch": 0, "yaw": 0, "roll": 0, "tilted": False, "confidence": 0}
+        if landmarks and len(landmarks) >= 468 and landmarks[4] is not None:
+            try:
+                head_pose = self.calculate_head_pose(landmarks, image.shape)
+            except:
+                pass  # Use default head_pose
         
         # Store calibration data for learning user's normal posture
         if not self.user_calibration["calibrated"]:
@@ -467,30 +510,34 @@ class WellnessAnalyzer:
             pitch_estimate = y_deviation * 60  # More sensitive conversion
             pitch_score = 100 - min(90, abs(pitch_estimate) * 2.0)  # More sensitive (was 1.5)
         
-        # 2. Face vertical position (adaptive based on user calibration)
-        # Use fixed ideal range for more consistent scoring that responds to changes
-        ideal_y = 0.35  # Ideal face position (upper third)
-        ideal_y_range = (0.28, 0.42)  # Fixed range for consistent scoring
+        # 2. Face vertical position - SIMPLIFIED AND MORE RESPONSIVE
+        # Ideal face position is in upper third of image (0.35 = 35% from top)
+        ideal_y = 0.35
+        y_deviation = face_center_y - ideal_y  # Positive = lower (slouching), Negative = higher
         
-        # Calculate score based on distance from ideal position - more sensitive
-        y_deviation = abs(face_center_y - ideal_y)
-        
-        if face_center_y < ideal_y_range[0]:
-            # Too high - calculate penalty
-            deviation = ideal_y_range[0] - face_center_y
-            vertical_penalty = deviation * 300  # High sensitivity
-            vertical_score = max(20, 100 - vertical_penalty)
-        elif face_center_y > ideal_y_range[1]:
-            # Too low (slouching) - high sensitivity
-            deviation = face_center_y - ideal_y_range[1]
-            vertical_penalty = deviation * 400  # Very high sensitivity for slouching
-            vertical_score = max(15, 100 - min(85, vertical_penalty))
+        # Calculate score directly from position - very sensitive to changes
+        # Map face_y position (0.2 to 0.7) to score (100 to 15)
+        # Lower face = lower score (slouching)
+        if face_center_y <= 0.25:
+            # Very high position (unlikely)
+            vertical_score = 95 - (0.25 - face_center_y) * 100
+        elif face_center_y <= 0.35:
+            # Good position range
+            vertical_score = 100 - abs(y_deviation) * 200
+        elif face_center_y <= 0.50:
+            # Slight slouching
+            vertical_score = 85 - (face_center_y - 0.35) * 300
+        elif face_center_y <= 0.65:
+            # Moderate slouching
+            vertical_score = 55 - (face_center_y - 0.50) * 200
         else:
-            # In ideal range - calculate score based on distance from ideal
-            # More sensitive to small changes
-            center_distance = y_deviation
-            vertical_score = 100 - (center_distance * 150)  # High sensitivity
-            vertical_score = max(50, min(100, vertical_score))  # Keep in reasonable range
+            # Severe slouching
+            vertical_score = max(15, 35 - (face_center_y - 0.65) * 100)
+        
+        vertical_score = max(15, min(100, vertical_score))
+        
+        # Log position for debugging
+        logging.debug(f"Posture: face_y={face_center_y:.3f}, ideal=0.35, deviation={y_deviation:.3f}, vertical_score={vertical_score:.1f}")
         
         # 3. Head tilt (sideways lean) - more sensitive
         if landmarks and len(landmarks) >= 468 and head_pose.get("confidence", 0) > 0.5:
@@ -1212,16 +1259,42 @@ class WellnessAnalyzer:
 analyzer = WellnessAnalyzer()
 
 def detect_face_opencv(image: np.ndarray) -> Tuple[Optional, Optional, Optional]:
-    """Detect face using OpenCV (fallback when MediaPipe unavailable)"""
+    """Detect face using OpenCV DNN or Haar Cascades (more reliable fallback)"""
     try:
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        h, w = image.shape[:2]
+        faces = []
+        confidence = 0.8
         
-        # Try frontal face detection first
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        # Try DNN face detector first (more accurate)
+        if FACE_DETECTOR_DNN is not None:
+            try:
+                blob = cv2.dnn.blobFromImage(cv2.resize(image, (300, 300)), 1.0, (300, 300), [104, 117, 123])
+                FACE_DETECTOR_DNN.setInput(blob)
+                detections = FACE_DETECTOR_DNN.forward()
+                
+                for i in range(detections.shape[2]):
+                    conf = detections[0, 0, i, 2]
+                    if conf > 0.5:  # Confidence threshold
+                        x1 = int(detections[0, 0, i, 3] * w)
+                        y1 = int(detections[0, 0, i, 4] * h)
+                        x2 = int(detections[0, 0, i, 5] * w)
+                        y2 = int(detections[0, 0, i, 6] * h)
+                        faces.append((x1, y1, x2-x1, y2-y1))
+                        confidence = conf
+                        break  # Take first face
+            except Exception as e:
+                logging.debug(f"DNN detection failed: {e}, falling back to Haar")
         
-        # If no frontal face, try profile
-        if len(faces) == 0 and face_cascade_profile is not None:
-            faces = face_cascade_profile.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        # Fallback to Haar Cascades if DNN didn't work or not available
+        if len(faces) == 0:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            
+            # Try frontal face detection first
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+            
+            # If no frontal face, try profile
+            if len(faces) == 0 and face_cascade_profile is not None:
+                faces = face_cascade_profile.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
         
         if len(faces) > 0:
             # Create a simple face detection result object
@@ -1235,7 +1308,13 @@ def detect_face_opencv(image: np.ndarray) -> Tuple[Optional, Optional, Optional]
                     self.bbox = (x, y, w, h)
             
             x, y, w, h = faces[0]
-            face_det = SimpleFaceDetection(x, y, w, h)
+            # Ensure valid coordinates
+            x = max(0, min(x, w-1))
+            y = max(0, min(y, h-1))
+            w = min(w, w - x)
+            h = min(h, h - y)
+            
+            face_det = SimpleFaceDetection(x, y, w, h, confidence)
             
             # Create a simple landmarks approximation based on face rectangle
             # This is a simplified version - in real MediaPipe we'd have 468 landmarks

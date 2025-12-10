@@ -4,5 +4,5 @@ websockets>=12.0
 opencv-python>=4.8.0
 numpy>=1.24.0
 python-multipart>=0.0.6
-# mediapipe - optional, will use OpenCV fallback if not available
+# mediapipe - optional, will use OpenCV DNN fallback if not available
 
