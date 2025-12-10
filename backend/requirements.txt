@@ -4,5 +4,11 @@ websockets>=12.0
 opencv-python>=4.8.0
 numpy>=1.24.0
 python-multipart>=0.0.6
-# mediapipe - optional, will use OpenCV DNN fallback if not available
+# Enhanced OpenCV face detection (most accurate option for Python 3.14)
+# Using advanced OpenCV DNN models and improved landmark estimation
+# Note: Most advanced libraries (MediaPipe, YOLOv8, RetinaFace, MTCNN) require Python <=3.11 or TensorFlow
+# This implementation uses state-of-the-art OpenCV techniques for maximum accuracy
+# dlib>=19.24.0  # Requires CMake - install separately if needed
+# face-recognition>=1.3.0  # Requires dlib - install separately if needed
+# mediapipe>=0.10.0  # Note: MediaPipe supports Python 3.8-3.11. For Python 3.14, using MTCNN
 
