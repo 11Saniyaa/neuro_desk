@@ -60,8 +60,8 @@ app.add_middleware(
 
 sessions: Dict[str, Dict] = {}
 
-# Frame skipping configuration
-FRAME_SKIP = 3  # Process every Nth frame (3 = process every 3rd frame, 66% reduction)
+# Frame skipping configuration - reduced for more real-time updates
+FRAME_SKIP = 2  # Process every Nth frame (2 = process every 2nd frame, 50% reduction for better responsiveness)
 
 def get_session_history(session_id: str) -> Tuple[deque, deque]:
     """Get or create session history for temporal smoothing"""
@@ -567,9 +567,9 @@ class WellnessAnalyzer:
                 eye_strain_risk = "low"
             
             eye_score = max(45, min(95, base_score))
-        
-        return {
-            "eye_strain_risk": eye_strain_risk,
+            
+            return {
+                "eye_strain_risk": eye_strain_risk,
                 "score": round(eye_score, 2),
                 "blink_rate": round(blink_rate, 3),
                 "ear_avg": round(avg_ear, 3)
@@ -998,9 +998,9 @@ class WellnessAnalyzer:
             else:
                 stress_score = 80  # Lower if no face
                 stress_level = "low"
-        
-        return {
-            "stress_level": stress_level,
+            
+            return {
+                "stress_level": stress_level,
                 "score": round(stress_score, 2),
                 "indicators": []
             }
@@ -1488,10 +1488,10 @@ async def analyze_frame(request: AnalyzeRequest):
         # Frame skipping: Process every Nth frame, return cached result for others
         should_process = (frame_count % FRAME_SKIP == 0)
         
-        # Check if we have a recent cached result (within last 1 second)
+        # Check if we have a recent cached result (within last 0.5 seconds for more responsiveness)
         if not should_process and session_data.get("last_result"):
             last_result_time = session_data.get("last_result_time")
-            if last_result_time and (datetime.now() - last_result_time).total_seconds() < 1.0:
+            if last_result_time and (datetime.now() - last_result_time).total_seconds() < 0.5:
                 logging.debug(f"Frame {frame_count}: Using cached result (frame skipping)")
                 return JSONResponse(content=session_data["last_result"], status_code=200)
         
@@ -1598,10 +1598,16 @@ async def analyze_frame(request: AnalyzeRequest):
             logging.info(f"Face detected: {face_results is not None}, Landmarks: {has_landmarks}, "
                         f"Face center: ({posture.get('face_position_x', 'N/A')}, {posture.get('face_position_y', 'N/A')})")
             
+            # Always update timestamp to ensure freshness
+            response["timestamp"] = datetime.now().isoformat()
+            
             # Cache result for frame skipping
             if session_id in sessions:
                 sessions[session_id]["last_result"] = response
                 sessions[session_id]["last_result_time"] = datetime.now()
+            
+            # Log that we're sending fresh analysis
+            logging.info(f"📤 Sending fresh analysis - Posture: {posture.get('score')}, Eye: {eye_strain.get('score')}, Engagement: {engagement.get('score')}, Stress: {stress.get('score')}")
             
             return JSONResponse(content=response, status_code=200)
         except Exception as analysis_err:
@@ -1716,10 +1722,10 @@ async def websocket_endpoint(websocket: WebSocket):
             # Frame skipping: Process every Nth frame, return cached result for others
             should_process = (frame_count % FRAME_SKIP == 0)
             
-            # Check if we have a recent cached result (within last 1 second)
+            # Check if we have a recent cached result (within last 0.5 seconds for more responsiveness)
             if not should_process and session_data.get("last_result"):
                 last_result_time = session_data.get("last_result_time")
-                if last_result_time and (datetime.now() - last_result_time).total_seconds() < 1.0:
+                if last_result_time and (datetime.now() - last_result_time).total_seconds() < 0.5:
                     logging.debug(f"Frame {frame_count}: Using cached result (frame skipping)")
                     try:
                         await websocket.send_json(session_data["last_result"])
@@ -1793,10 +1799,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 "recommendations": recommendations
             }
             
+            # Always update timestamp to ensure freshness
+            response["timestamp"] = datetime.now().isoformat()
+            
             # Cache result for frame skipping
             if session_id in sessions:
                 sessions[session_id]["last_result"] = response
                 sessions[session_id]["last_result_time"] = datetime.now()
+            
+            # Log that we're sending fresh analysis
+            logging.info(f"📤 Sending fresh analysis via WebSocket - Posture: {posture.get('score')}, Eye: {eye_strain.get('score')}, Engagement: {engagement.get('score')}, Stress: {stress.get('score')}")
             
             try:
                 await websocket.send_json(response)
