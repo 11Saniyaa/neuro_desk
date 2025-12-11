@@ -228,6 +228,15 @@ class WellnessAnalyzer:
         # Real-world adjustments
         self.lighting_adaptation = 1.0  # Adapts to lighting conditions
         self.distance_adaptation = 1.0  # Adapts to camera distance
+        
+        # Temporal smoothing buffers for more stable results
+        self.posture_history = deque(maxlen=10)  # Last 10 posture scores
+        self.eye_strain_history = deque(maxlen=10)  # Last 10 eye strain scores
+        self.engagement_history = deque(maxlen=10)  # Last 10 engagement scores
+        self.stress_history = deque(maxlen=10)  # Last 10 stress scores
+        
+        # Outlier detection thresholds
+        self.outlier_threshold = 2.5  # Standard deviations for outlier detection
     
     def _calibrate_posture(self):
         """Calibrate to user's normal posture position"""
@@ -303,6 +312,30 @@ class WellnessAnalyzer:
             logging.warning(f"Error getting adaptive threshold: {e}")
             return (0.28, 0.42)  # Default range
         
+    def preprocess_image(self, image: np.ndarray) -> np.ndarray:
+        """Enhanced image preprocessing for better face detection accuracy"""
+        try:
+            # Convert to grayscale if needed
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = image.copy()
+            
+            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+            
+            # Optional: Apply bilateral filter to reduce noise while preserving edges
+            filtered = cv2.bilateralFilter(enhanced, 9, 75, 75)
+            
+            # Convert back to RGB if original was RGB
+            if len(image.shape) == 3:
+                return cv2.cvtColor(filtered, cv2.COLOR_GRAY2RGB)
+            return filtered
+        except Exception as e:
+            logging.warning(f"Image preprocessing error: {e}")
+            return image
+    
     def _adapt_to_lighting(self, image: np.ndarray):
         """Adapt analysis to current lighting conditions"""
         # Calculate average brightness
@@ -349,6 +382,97 @@ class WellnessAnalyzer:
         except Exception as e:
             logging.warning(f"Error validating image quality: {e}")
             return {"valid": True, "quality_score": 70}  # Default to valid if check fails
+    
+    def smooth_temporal_data(self, new_value: float, history: deque, alpha: float = 0.3) -> float:
+        """Apply exponential moving average for temporal smoothing"""
+        if len(history) == 0:
+            history.append(new_value)
+            return new_value
+        
+        # Get last smoothed value
+        last_smoothed = history[-1]
+        
+        # Apply EMA
+        smoothed = alpha * new_value + (1 - alpha) * last_smoothed
+        
+        # Detect outliers and handle them
+        if len(history) >= 3:
+            recent_values = list(history)[-3:]
+            mean_val = np.mean(recent_values)
+            std_val = np.std(recent_values)
+            
+            # If new value is outlier, use more smoothing
+            if std_val > 0 and abs(new_value - mean_val) > self.outlier_threshold * std_val:
+                alpha = 0.1  # More smoothing for outliers
+                smoothed = alpha * new_value + (1 - alpha) * last_smoothed
+                logging.debug(f"Outlier detected: {new_value:.2f}, using more smoothing")
+        
+        history.append(smoothed)
+        return smoothed
+    
+    def calculate_gaze_direction(self, landmarks, image_shape) -> Dict:
+        """Estimate gaze direction from eye landmarks for better engagement analysis"""
+        if not landmarks or len(landmarks) < 468:
+            return {"direction": "forward", "confidence": 0, "angle": 0}
+        
+        try:
+            h, w = image_shape[:2]
+            
+            # Get eye center points
+            left_eye_center = landmarks[33]  # Left eye outer
+            right_eye_center = landmarks[362]  # Right eye outer
+            
+            # Calculate eye center in image coordinates
+            left_eye_x = left_eye_center.x * w
+            left_eye_y = left_eye_center.y * h
+            right_eye_x = right_eye_center.x * w
+            right_eye_y = right_eye_center.y * h
+            
+            # Calculate eye center midpoint
+            eye_center_x = (left_eye_x + right_eye_x) / 2
+            eye_center_y = (left_eye_y + right_eye_y) / 2
+            
+            # Get nose tip for reference
+            nose_tip = landmarks[4]
+            nose_x = nose_tip.x * w
+            nose_y = nose_tip.y * h
+            
+            # Calculate gaze vector (from nose to eye center)
+            gaze_dx = eye_center_x - nose_x
+            gaze_dy = eye_center_y - nose_y
+            
+            # Calculate angle (0 = forward, positive = right, negative = left)
+            gaze_angle = np.arctan2(gaze_dx, abs(gaze_dy)) * 180 / np.pi
+            
+            # Determine direction
+            if abs(gaze_angle) < 10:
+                direction = "forward"
+                confidence = 0.9
+            elif gaze_angle > 10:
+                direction = "right"
+                confidence = 0.7
+            else:
+                direction = "left"
+                confidence = 0.7
+            
+            # Check if looking up or down
+            vertical_offset = eye_center_y - nose_y
+            if vertical_offset < -10:
+                direction = "up"
+                confidence = 0.6
+            elif vertical_offset > 10:
+                direction = "down"
+                confidence = 0.6
+            
+            return {
+                "direction": direction,
+                "confidence": confidence,
+                "angle": round(gaze_angle, 2),
+                "vertical_offset": round(vertical_offset, 2)
+            }
+        except Exception as e:
+            logging.warning(f"Error calculating gaze direction: {e}")
+            return {"direction": "forward", "confidence": 0, "angle": 0}
     
     def calculate_eye_aspect_ratio(self, landmarks, eye_points) -> float:
         """Calculate Eye Aspect Ratio (EAR) using improved 6-point method with validation"""
@@ -724,6 +848,10 @@ class WellnessAnalyzer:
             final_score = max(15, min(100, round(final_score, 2)))
             logging.error(f"🔄 EMERGENCY: Forced score to {final_score} from face_y={face_center_y:.3f}")
         
+        # Apply temporal smoothing for more stable results
+        smoothed_score = self.smooth_temporal_data(final_score, self.posture_history, alpha=0.4)
+        final_score = round(smoothed_score, 2)
+        
         return {
             "slouching": slouching,
             "score": final_score,
@@ -962,9 +1090,13 @@ class WellnessAnalyzer:
         
         eye_score = max(0, min(100, eye_score))
         
+        # Apply temporal smoothing for more stable results
+        smoothed_score = self.smooth_temporal_data(eye_score, self.eye_strain_history, alpha=0.3)
+        eye_score = round(smoothed_score, 2)
+        
         return {
             "eye_strain_risk": eye_strain_risk,
-            "score": round(eye_score, 2),
+            "score": eye_score,
             "blink_rate": round(blink_rate, 3),
             "ear_avg": round(avg_ear, 3)
         }
@@ -1069,6 +1201,17 @@ class WellnessAnalyzer:
             else:
                 orientation_score = 50
         
+        # 3.5. Gaze direction tracking (new improvement)
+        gaze_info = self.calculate_gaze_direction(landmarks, image_shape)
+        gaze_bonus = 0
+        if gaze_info["confidence"] > 0.5:
+            if gaze_info["direction"] == "forward":
+                gaze_bonus = 8  # Bonus for looking forward
+            elif gaze_info["direction"] in ["left", "right"]:
+                gaze_bonus = -5  # Penalty for looking away
+            elif gaze_info["direction"] == "down":
+                gaze_bonus = -8  # Penalty for looking down (distracted)
+        
         # 4. Face size/confidence (larger face = closer = more engaged)
         if face_detection_result and hasattr(face_detection_result, 'detections') and len(face_detection_result.detections) > 0:
             detection = face_detection_result.detections[0]
@@ -1095,8 +1238,12 @@ class WellnessAnalyzer:
             stability_score * 0.40 + 
             orientation_score * 0.30 + 
             confidence_score * 0.10
-        ) + size_bonus
+        ) + size_bonus + gaze_bonus
         engagement_score = max(15, min(100, engagement_score))  # Wider range
+        
+        # Apply temporal smoothing for more stable results
+        smoothed_score = self.smooth_temporal_data(engagement_score, self.engagement_history, alpha=0.35)
+        engagement_score = round(smoothed_score, 2)
         
         # Determine concentration level
         if engagement_score >= 75:
@@ -1314,9 +1461,13 @@ class WellnessAnalyzer:
             stress_level = "low"
             stress_score = 85
         
+        # Apply temporal smoothing for more stable results
+        smoothed_score = self.smooth_temporal_data(stress_score, self.stress_history, alpha=0.3)
+        stress_score = round(smoothed_score, 2)
+        
         return {
             "stress_level": stress_level,
-            "score": round(stress_score, 2),
+            "score": stress_score,
             "indicators": stress_indicators
         }
     
@@ -2021,6 +2172,9 @@ async def analyze_frame(request: AnalyzeRequest):
             image = decode_image(image_data)
             logging.info(f"Image decoded successfully, shape: {image.shape}")
             
+            # Preprocess image for better face detection accuracy
+            image = analyzer.preprocess_image(image)
+            
             # Validate image quality before processing
             quality_check = analyzer.validate_image_quality(image)
             if not quality_check.get("valid", True):
@@ -2332,6 +2486,9 @@ async def websocket_endpoint(websocket: WebSocket):
             # Decode image
             try:
                 image = decode_image(frame_data["image"])
+                
+                # Preprocess image for better face detection accuracy
+                image = analyzer.preprocess_image(image)
                 
                 # Detect face and landmarks using MediaPipe
                 face_results, landmarks, mesh_results = detect_face_mediapipe(image)
