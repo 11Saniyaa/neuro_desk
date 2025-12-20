@@ -381,7 +381,8 @@ class WellnessAnalyzer:
             }
         except Exception as e:
             logging.warning(f"Error validating image quality: {e}")
-            return {"valid": True, "quality_score": 70}  # Default to valid if check fails
+            # Return None instead of static default - let caller decide
+            return None
     
     def smooth_temporal_data(self, new_value: float, history: deque, alpha: float = 0.3) -> float:
         """Apply exponential moving average for temporal smoothing"""
@@ -698,8 +699,9 @@ class WellnessAnalyzer:
                         break
             
             if not face_detected or face_center_x is None or face_center_y is None:
-                logging.warning(f"⚠️ No face detected! face_detected={face_detected}, face_center_x={face_center_x}, face_center_y={face_center_y}")
-                return {"slouching": True, "score": 35, "head_angle": 0, "face_position_y": 0.5, "face_position_x": 0.5, "reason": "no_face_detected"}
+                logging.warning(f"⚠️ No face detected! Cannot analyze posture without face detection")
+                # Return None instead of static default - let caller handle missing data
+                return None
         
         # Log face position detection for debugging - ALWAYS log
         logging.info(f"👤 Face detected: center_y={face_center_y:.3f}, center_x={face_center_x:.3f}, size={face_size:.3f if face_size else 'N/A'}")
@@ -866,50 +868,57 @@ class WellnessAnalyzer:
         if session_history is None:
             session_history = deque(maxlen=30)
         
-        # If no landmarks, estimate based on face detection and time
+        # If no landmarks, use history data if available - no static defaults
         if landmarks is None or len(landmarks) < 468:
-            # Estimate eye strain based on session duration and face detection
-            if len(session_history) > 0:
-                # If we have history, use average
-                avg_ear = np.mean(list(session_history)) if session_history else 0.28
-            else:
-                # Estimate based on face detection if available
-                avg_ear = 0.28  # Default
-                session_history.append(avg_ear)
-            
-            # Estimate blink rate from history
-            if len(session_history) > 5:
-                recent_ears = list(session_history)[-10:]
-                blink_threshold = 0.25
+            # Only use history if we have enough data
+            if len(session_history) > 10:
+                # Use actual history data
+                recent_ears = list(session_history)[-20:]
+                avg_ear = np.mean(recent_ears)
+                
+                # Calculate blink rate from actual history
+                blink_threshold = self.ear_baseline - 2 * self.ear_std if self.ear_std > 0 else 0.20
                 blinks = sum(1 for ear in recent_ears if ear < blink_threshold)
-                blink_rate = blinks / len(recent_ears) if recent_ears else 0.15
+                blink_rate = (blinks / len(recent_ears)) * 20 if recent_ears else 0  # Estimate blinks/min
+                
+                # Calculate score from actual EAR measurements
+                if self.user_calibration["calibrated"]:
+                    ear_deviation = abs(avg_ear - self.ear_baseline)
+                    if avg_ear < self.ear_baseline - 2 * self.ear_std:
+                        eye_strain_risk = "high"
+                        eye_score = max(30, 100 - ear_deviation * 200)
+                    elif avg_ear < self.ear_baseline - self.ear_std:
+                        eye_strain_risk = "medium"
+                        eye_score = max(50, 100 - ear_deviation * 150)
+                    else:
+                        eye_strain_risk = "low"
+                        eye_score = min(95, 80 + (self.ear_baseline - avg_ear) * 50)
+                else:
+                    # Use standard thresholds if not calibrated
+                    if avg_ear < 0.20:
+                        eye_strain_risk = "high"
+                        eye_score = 40
+                    elif avg_ear < 0.25:
+                        eye_strain_risk = "medium"
+                        eye_score = 60
+                    else:
+                        eye_strain_risk = "low"
+                        eye_score = 80
+                
+                if blink_rate < 0.05:
+                    eye_strain_risk = "medium" if eye_strain_risk == "low" else eye_strain_risk
+                    eye_score = max(45, eye_score - 15)
+                
+                return {
+                    "eye_strain_risk": eye_strain_risk,
+                    "score": round(eye_score, 2),
+                    "blink_rate": round(blink_rate, 3),
+                    "ear_avg": round(avg_ear, 3)
+                }
             else:
-                blink_rate = 0.15  # Normal blink rate
-            
-            # Score based on estimated values with more variation
-            base_score = 80
-            if avg_ear < 0.24:
-                base_score -= 18
-            elif avg_ear > 0.32:
-                base_score += 8
-            
-            if blink_rate < 0.05:
-                eye_strain_risk = "medium"
-                base_score -= 18
-            elif blink_rate > 0.25:
-                eye_strain_risk = "low-medium"
-                base_score -= 10
-            else:
-                eye_strain_risk = "low"
-            
-            eye_score = max(45, min(95, base_score))
-            
-            return {
-                "eye_strain_risk": eye_strain_risk,
-                "score": round(eye_score, 2),
-                "blink_rate": round(blink_rate, 3),
-                "ear_avg": round(avg_ear, 3)
-            }
+                # Not enough data - return None instead of static default
+                logging.warning("⚠️ Insufficient data for eye strain analysis - need landmarks or history")
+                return None
         
         # Calculate EAR for both eyes using improved method
         left_ear = self.calculate_eye_aspect_ratio(landmarks, self.LEFT_EYE_POINTS)
@@ -917,8 +926,9 @@ class WellnessAnalyzer:
         
         # Validate EAR values (normal range: 0.2-0.4)
         if left_ear == 0.0 and right_ear == 0.0:
-            # No valid eye data
-            return {"eye_strain_risk": "unknown", "score": 50, "blink_rate": 0, "ear_avg": 0.0}
+            # No valid eye data - return None instead of static default
+            logging.warning("⚠️ No valid EAR data detected")
+            return None
         
         # Use average, or single eye if one is invalid
         if left_ear > 0 and right_ear > 0:
@@ -1472,8 +1482,25 @@ class WellnessAnalyzer:
         }
     
     def calculate_productivity_score(self, posture, eye_strain, engagement, stress) -> Dict:
-        """Calculate overall productivity score with error handling"""
+        """Calculate overall productivity score based on actual measurements - no static defaults"""
         try:
+            # Only calculate if we have valid data - no static defaults
+            if not posture or not eye_strain or not engagement or not stress:
+                logging.warning("⚠️ Missing analysis data for productivity calculation")
+                return None
+            
+            # Get actual scores - fail if missing (no defaults)
+            posture_score = posture.get("score")
+            eye_strain_score = eye_strain.get("score")
+            engagement_score = engagement.get("score")
+            stress_score = stress.get("score")
+            
+            # Validate that we have actual measurements
+            if posture_score is None or eye_strain_score is None or engagement_score is None or stress_score is None:
+                logging.warning("⚠️ Missing score values in analysis data")
+                return None
+            
+            # Dynamic weights based on data quality
             weights = {
                 "posture": 0.25,
                 "eye_strain": 0.20,
@@ -1481,12 +1508,7 @@ class WellnessAnalyzer:
                 "stress": 0.25
             }
             
-            # Safely get scores with defaults
-            posture_score = posture.get("score", 70) if posture else 70
-            eye_strain_score = eye_strain.get("score", 100) if eye_strain else 100
-            engagement_score = engagement.get("score", 50) if engagement else 50
-            stress_score = stress.get("score", 100) if stress else 100
-            
+            # Calculate weighted productivity from actual measurements
             productivity = (
                 posture_score * weights["posture"] +
                 eye_strain_score * weights["eye_strain"] +
@@ -1494,9 +1516,9 @@ class WellnessAnalyzer:
                 stress_score * weights["stress"]
             )
             
-            # Safely get risk levels
-            eye_strain_risk = eye_strain.get("eye_strain_risk", "low") if eye_strain else "low"
-            is_slouching = posture.get("slouching", False) if posture else False
+            # Get risk levels from actual data
+            eye_strain_risk = eye_strain.get("eye_strain_risk", "low")
+            is_slouching = posture.get("slouching", False)
             
             return {
                 "productivity_score": round(productivity, 2),
@@ -1506,12 +1528,8 @@ class WellnessAnalyzer:
             }
         except Exception as e:
             logging.error(f"Error calculating productivity score: {e}", exc_info=True)
-            return {
-                "productivity_score": 70.0,
-                "break_needed": False,
-                "eye_exercise_needed": False,
-                "posture_reminder": False
-            }
+            # Return None instead of static default - let caller handle it
+            return None
     
     def get_recommendations(self, analysis: Dict) -> list:
         """Generate wellness recommendations with error handling"""
@@ -2293,106 +2311,141 @@ async def analyze_frame(request: AnalyzeRequest):
                     logging.error(f"❌ Cannot recalculate - face_y is default 0.5! Face may not be detected.")
         except Exception as e:
             logging.error(f"❌ Posture analysis error: {e}", exc_info=True)
-            # Use a more varied default based on face detection
-            if face_results is not None:
-                default_score = 65  # Lower if face detected but analysis failed
-            else:
-                default_score = 40  # Much lower if no face
-            posture = {"slouching": True, "score": default_score, "head_angle": 0, "face_position_y": 0.5, "face_position_x": 0.5, "error": str(e)}
+            # Return None instead of static default - let caller handle error
+            return None
         
         try:
             eye_strain = analyzer.analyze_eye_strain(image, landmarks, ear_history)
             logging.info(f"✅ Eye strain analysis successful: score={eye_strain.get('score')}, EAR={eye_strain.get('ear_avg')}")
         except Exception as e:
             logging.error(f"❌ Eye strain analysis error: {e}", exc_info=True)
-            # Use history if available
-            if len(ear_history) > 0:
-                avg_ear = np.mean(list(ear_history))
-                estimated_score = max(60, min(95, 80 + (avg_ear - 0.28) * 50))
+            # Use history if available - calculate from actual data
+            if len(ear_history) > 10:
+                avg_ear = np.mean(list(ear_history)[-20:])
+                # Calculate score from actual EAR measurement
+                if analyzer.user_calibration["calibrated"]:
+                    ear_deviation = abs(avg_ear - analyzer.ear_baseline)
+                    estimated_score = max(30, min(95, 100 - ear_deviation * 150))
+                else:
+                    estimated_score = max(50, min(95, 80 + (avg_ear - 0.28) * 50))
+                eye_strain = {"eye_strain_risk": "low", "score": estimated_score, "blink_rate": 0, "ear_avg": avg_ear, "error": str(e)}
             else:
-                estimated_score = 75  # Middle ground
-            eye_strain = {"eye_strain_risk": "low", "score": estimated_score, "blink_rate": 0, "ear_avg": 0.28, "error": str(e)}
+                # Not enough data - return None instead of static default
+                logging.warning("⚠️ Insufficient data for eye strain analysis after error")
+                eye_strain = None
         
         try:
             engagement = analyzer.analyze_engagement(landmarks, face_results, head_position_history, image.shape)
             logging.info(f"✅ Engagement analysis successful: score={engagement.get('score')}")
         except Exception as e:
             logging.error(f"❌ Engagement analysis error: {e}", exc_info=True)
-            # Estimate based on face detection and movement
-            if face_results is not None:
-                if len(head_position_history) > 5:
-                    positions = list(head_position_history)
-                    variance = np.var([p[0] for p in positions]) + np.var([p[1] for p in positions])
-                    estimated_score = max(40, min(80, 70 - variance * 1000))
-                else:
-                    estimated_score = 60
+            # Estimate based on actual face detection and movement data
+            if face_results is not None and len(head_position_history) > 5:
+                positions = list(head_position_history)
+                variance = np.var([p[0] for p in positions]) + np.var([p[1] for p in positions])
+                # Calculate from actual movement variance
+                estimated_score = max(20, min(90, 80 - variance * 2000))
+                stability = max(0, min(1, 1 - variance * 100))
+                engagement = {"concentration": "medium" if estimated_score > 50 else "low", "score": estimated_score, "face_visible": True, "head_stability": round(stability, 2), "error": str(e)}
             else:
-                estimated_score = 30
-            engagement = {"concentration": "low", "score": estimated_score, "face_visible": face_results is not None, "head_stability": 0, "error": str(e)}
+                # Not enough data - return None instead of static default
+                logging.warning("⚠️ Insufficient data for engagement analysis after error")
+                engagement = None
         
         try:
             stress = analyzer.analyze_stress(image, landmarks, face_results)
             logging.info(f"✅ Stress analysis successful: score={stress.get('score')}")
         except Exception as e:
             logging.error(f"❌ Stress analysis error: {e}", exc_info=True)
-            # Default to moderate stress if analysis fails
-            stress = {"stress_level": "low", "score": 85, "indicators": [], "error": str(e)}
+            # Return None instead of static default - let caller handle error
+            logging.warning("⚠️ Stress analysis failed - returning None")
+            stress = None
             
-        # Calculate productivity
-        try:
-            productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
-            logging.info(f"✅ Productivity calculated: {productivity.get('productivity_score')}")
-            
-            # Force variation if productivity is exactly 70 (likely a default)
-            if productivity.get('productivity_score') == 70.0:
-                logging.warning("⚠️ Productivity score is exactly 70 - might be default value, adding variation")
-                # Add variation based on individual scores
-                base_variation = (posture.get('score', 70) - 70) * 0.25
-                productivity["productivity_score"] = round(70 + base_variation, 2)
-                productivity["productivity_score"] = max(15, min(100, productivity["productivity_score"]))
-                logging.info(f"🔄 Adjusted productivity score to {productivity['productivity_score']}")
-        except Exception as e:
-            logging.error(f"Productivity calculation error: {e}", exc_info=True)
-            # Calculate a varied default based on posture
-            default_prod = 70 + (posture.get('score', 70) - 70) * 0.3 if posture else 70
-            productivity = {"productivity_score": round(default_prod, 2), "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False}
-            
-            # Get recommendations
-        try:
-            recommendations = analyzer.get_recommendations({
-                **productivity,
-                "stress_level": stress.get("stress_level", "low"),
-                "blink_rate": eye_strain.get("blink_rate", 0)
-            })
-        except Exception as e:
-            logging.error(f"Recommendations error: {e}", exc_info=True)
-            recommendations = []
+        # Calculate productivity - only if we have all required data
+        productivity = None
+        if posture and eye_strain and engagement and stress:
+            try:
+                productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
+                if productivity:
+                    logging.info(f"✅ Productivity calculated: {productivity.get('productivity_score')}")
+                else:
+                    logging.warning("⚠️ Productivity calculation returned None - missing data")
+            except Exception as e:
+                logging.error(f"Productivity calculation error: {e}", exc_info=True)
+                productivity = None
         
-        # Prepare response
+        # If productivity calculation failed, calculate from available data
+        if not productivity:
+            logging.warning("⚠️ Cannot calculate productivity - missing analysis data")
+            # Try to calculate from available components
+            available_scores = []
+            if posture and posture.get('score') is not None:
+                available_scores.append(('posture', posture.get('score')))
+            if eye_strain and eye_strain.get('score') is not None:
+                available_scores.append(('eye_strain', eye_strain.get('score')))
+            if engagement and engagement.get('score') is not None:
+                available_scores.append(('engagement', engagement.get('score')))
+            if stress and stress.get('score') is not None:
+                available_scores.append(('stress', stress.get('score')))
+            
+            if len(available_scores) >= 2:
+                # Calculate partial productivity from available scores
+                weights = {"posture": 0.25, "eye_strain": 0.20, "engagement": 0.30, "stress": 0.25}
+                total_weight = sum(weights.get(name, 0) for name, _ in available_scores)
+                weighted_sum = sum(score * weights.get(name, 0) for name, score in available_scores)
+                partial_productivity = weighted_sum / total_weight if total_weight > 0 else None
+                
+                if partial_productivity:
+                    productivity = {
+                        "productivity_score": round(partial_productivity, 2),
+                        "break_needed": partial_productivity < 60,
+                        "eye_exercise_needed": eye_strain.get("eye_strain_risk") in ["medium", "high"] if eye_strain else False,
+                        "posture_reminder": posture.get("slouching", False) if posture else False
+                    }
+                    logging.info(f"✅ Partial productivity calculated from {len(available_scores)} components: {productivity.get('productivity_score')}")
+                else:
+                    productivity = None
+            else:
+                productivity = None
+            
+        # Get recommendations - only if we have productivity data
+        recommendations = []
+        if productivity:
+            try:
+                rec_data = {
+                    **productivity,
+                    "stress_level": stress.get("stress_level", "low") if stress else "low",
+                    "blink_rate": eye_strain.get("blink_rate", 0) if eye_strain else 0
+                }
+                recommendations = analyzer.get_recommendations(rec_data)
+            except Exception as e:
+                logging.error(f"Recommendations error: {e}", exc_info=True)
+                recommendations = ["⚠️ Analysis in progress - collecting data..."]
+        else:
+            recommendations = ["⚠️ Analysis in progress - collecting data..."]
+        
+        # Prepare response - handle None values gracefully
         response = {
             "timestamp": datetime.now().isoformat(),
-            "posture": posture,
-            "eye_strain": eye_strain,
-            "engagement": engagement,
-            "stress": stress,
-            "productivity": productivity,
+            "posture": posture if posture else {"error": "No face detected or insufficient data"},
+            "eye_strain": eye_strain if eye_strain else {"error": "Insufficient data for analysis"},
+            "engagement": engagement if engagement else {"error": "Insufficient data for analysis"},
+            "stress": stress if stress else {"error": "Insufficient data for analysis"},
+            "productivity": productivity if productivity else {"error": "Cannot calculate - missing analysis data"},
             "recommendations": recommendations
         }
         
-        # Detailed logging for debugging constant scores
-        logging.info(f"📊 Analysis complete - Posture: {posture.get('score', 'N/A')} (face_y: {posture.get('face_position_y', 'N/A')}, head_angle: {posture.get('head_angle', 'N/A')}, slouching: {posture.get('slouching')}), "
-                    f"Eye: {eye_strain.get('score', 'N/A')} (EAR: {eye_strain.get('ear_avg', 'N/A')}, blinks: {eye_strain.get('blink_rate', 'N/A')}), "
-                    f"Engagement: {engagement.get('score', 'N/A')} (stability: {engagement.get('head_stability', 'N/A')}), "
-                    f"Stress: {stress.get('score', 'N/A')} ({stress.get('stress_level', 'N/A')}), "
-                    f"Productivity: {productivity.get('productivity_score', 'N/A')}")
-        has_landmarks = landmarks is not None and len(landmarks) > 0 if landmarks else False
-        logging.info(f"👤 Face detected: {face_results is not None}, Landmarks: {has_landmarks}, "
-                    f"Face center: ({posture.get('face_position_x', 'N/A')}, {posture.get('face_position_y', 'N/A')})")
+        # Detailed logging for debugging - handle None values
+        posture_score = posture.get('score', 'N/A') if posture else 'N/A'
+        eye_score = eye_strain.get('score', 'N/A') if eye_strain else 'N/A'
+        engagement_score = engagement.get('score', 'N/A') if engagement else 'N/A'
+        stress_score = stress.get('score', 'N/A') if stress else 'N/A'
+        productivity_score = productivity.get('productivity_score', 'N/A') if productivity else 'N/A'
         
-        # WARNING if scores are stuck at defaults
-        if posture.get('score') == 70.0 and productivity.get('productivity_score') == 70.0:
-            logging.warning("⚠️⚠️⚠️ WARNING: Scores are stuck at default 70! This indicates analysis may not be running properly!")
-            logging.warning(f"   Face detected: {face_results is not None}, Landmarks: {has_landmarks}, Face_y: {posture.get('face_position_y')}")
+        logging.info(f"📊 Analysis complete - Posture: {posture_score}, Eye: {eye_score}, Engagement: {engagement_score}, Stress: {stress_score}, Productivity: {productivity_score}")
+        has_landmarks = landmarks is not None and len(landmarks) > 0 if landmarks else False
+        face_pos = f"({posture.get('face_position_x', 'N/A')}, {posture.get('face_position_y', 'N/A')})" if posture else "N/A"
+        logging.info(f"👤 Face detected: {face_results is not None}, Landmarks: {has_landmarks}, Face center: {face_pos}")
         
         # Always update timestamp to ensure freshness
         response["timestamp"] = datetime.now().isoformat()
@@ -2404,7 +2457,11 @@ async def analyze_frame(request: AnalyzeRequest):
             sessions[session_id]["last_result_time"] = datetime.now()
         
         # Log that we're sending fresh analysis with position data
-        logging.info(f"📤 Sending FRESH analysis - Posture: {posture.get('score')} (face_y: {posture.get('face_position_y'):.3f}), Eye: {eye_strain.get('score')}, Engagement: {engagement.get('score')}, Stress: {stress.get('score')}")
+        posture_log = f"{posture.get('score')} (face_y: {posture.get('face_position_y'):.3f})" if posture and posture.get('score') else "N/A"
+        eye_log = eye_strain.get('score') if eye_strain and eye_strain.get('score') else "N/A"
+        engagement_log = engagement.get('score') if engagement and engagement.get('score') else "N/A"
+        stress_log = stress.get('score') if stress and stress.get('score') else "N/A"
+        logging.info(f"📤 Sending FRESH analysis - Posture: {posture_log}, Eye: {eye_log}, Engagement: {engagement_log}, Stress: {stress_log}")
         
         return JSONResponse(content=response, status_code=200)
         
@@ -2467,11 +2524,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     response = {
                         "timestamp": datetime.now().isoformat(),
                         "error": "Data parsing error",
-                        "posture": {"slouching": False, "score": 70},
-                        "eye_strain": {"eye_strain_risk": "low", "score": 100},
-                        "engagement": {"concentration": "low", "score": 50},
-                        "stress": {"stress_level": "low", "score": 100},
-                        "productivity": {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False},
+                        "posture": {"error": "Data parsing error"},
+                        "eye_strain": {"error": "Data parsing error"},
+                        "engagement": {"error": "Data parsing error"},
+                        "stress": {"error": "Data parsing error"},
+                        "productivity": {"error": "Cannot calculate - data parsing error"},
                         "recommendations": ["⚠️ Processing error, retrying..."]
                     }
                     await websocket.send_json(response)
@@ -2499,11 +2556,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     response = {
                         "timestamp": datetime.now().isoformat(),
                         "error": str(e),
-                        "posture": {"slouching": False, "score": 70},
-                        "eye_strain": {"eye_strain_risk": "low", "score": 100},
-                        "engagement": {"concentration": "low", "score": 50},
-                        "stress": {"stress_level": "low", "score": 100},
-                        "productivity": {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False},
+                        "posture": {"error": "Image processing error"},
+                        "eye_strain": {"error": "Image processing error"},
+                        "engagement": {"error": "Image processing error"},
+                        "stress": {"error": "Image processing error"},
+                        "productivity": {"error": "Cannot calculate - image processing error"},
                         "recommendations": ["⚠️ Image processing error, retrying..."]
                     }
                     await websocket.send_json(response)
@@ -2530,57 +2587,112 @@ async def websocket_endpoint(websocket: WebSocket):
             except Exception as e:
                 logging.warning(f"Lighting adaptation error: {e}")
             
-            # Analyze with error handling
+            # Analyze with error handling - no static defaults
+            posture = None
             try:
                 posture = analyzer.analyze_posture(image, landmarks, face_results)
             except Exception as e:
                 logging.error(f"Posture analysis error: {e}", exc_info=True)
-                posture = {"slouching": False, "score": 70, "head_angle": 0, "face_position_y": 0.5, "face_position_x": 0.5}
+                posture = None
             
+            eye_strain = None
             try:
                 eye_strain = analyzer.analyze_eye_strain(image, landmarks, ear_history)
             except Exception as e:
                 logging.error(f"Eye strain analysis error: {e}", exc_info=True)
-                eye_strain = {"eye_strain_risk": "low", "score": 100, "blink_rate": 0, "ear_avg": 0.28}
+                # Try to use history if available
+                if len(ear_history) > 10:
+                    avg_ear = np.mean(list(ear_history)[-20:])
+                    if analyzer.user_calibration["calibrated"]:
+                        ear_deviation = abs(avg_ear - analyzer.ear_baseline)
+                        estimated_score = max(30, min(95, 100 - ear_deviation * 150))
+                    else:
+                        estimated_score = max(50, min(95, 80 + (avg_ear - 0.28) * 50))
+                    eye_strain = {"eye_strain_risk": "low", "score": estimated_score, "blink_rate": 0, "ear_avg": avg_ear, "error": str(e)}
+                else:
+                    eye_strain = None
             
+            engagement = None
             try:
                 engagement = analyzer.analyze_engagement(landmarks, face_results, head_position_history, image.shape)
             except Exception as e:
                 logging.error(f"Engagement analysis error: {e}", exc_info=True)
-                engagement = {"concentration": "low", "score": 50, "face_visible": True, "head_stability": 0}
+                # Try to estimate from available data
+                if face_results is not None and len(head_position_history) > 5:
+                    positions = list(head_position_history)
+                    variance = np.var([p[0] for p in positions]) + np.var([p[1] for p in positions])
+                    estimated_score = max(20, min(90, 80 - variance * 2000))
+                    stability = max(0, min(1, 1 - variance * 100))
+                    engagement = {"concentration": "medium" if estimated_score > 50 else "low", "score": estimated_score, "face_visible": True, "head_stability": round(stability, 2), "error": str(e)}
+                else:
+                    engagement = None
             
+            stress = None
             try:
                 stress = analyzer.analyze_stress(image, landmarks, face_results)
             except Exception as e:
                 logging.error(f"Stress analysis error: {e}", exc_info=True)
-                stress = {"stress_level": "low", "score": 100, "indicators": []}
+                stress = None
             
-            # Calculate productivity
-            try:
-                productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
-            except Exception as e:
-                logging.error(f"Productivity calculation error: {e}", exc_info=True)
-                productivity = {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False}
+            # Calculate productivity - only if we have all required data
+            productivity = None
+            if posture and eye_strain and engagement and stress:
+                try:
+                    productivity = analyzer.calculate_productivity_score(posture, eye_strain, engagement, stress)
+                except Exception as e:
+                    logging.error(f"Productivity calculation error: {e}", exc_info=True)
+                    productivity = None
             
-            # Get recommendations
-            try:
-                recommendations = analyzer.get_recommendations({
-                    **productivity,
-                    "stress_level": stress.get("stress_level", "low"),
-                    "blink_rate": eye_strain.get("blink_rate", 0)
-                })
-            except Exception as e:
-                logging.error(f"Recommendations error: {e}", exc_info=True)
-                recommendations = []
+            # If productivity calculation failed, calculate from available data
+            if not productivity:
+                available_scores = []
+                if posture and posture.get('score') is not None:
+                    available_scores.append(('posture', posture.get('score')))
+                if eye_strain and eye_strain.get('score') is not None:
+                    available_scores.append(('eye_strain', eye_strain.get('score')))
+                if engagement and engagement.get('score') is not None:
+                    available_scores.append(('engagement', engagement.get('score')))
+                if stress and stress.get('score') is not None:
+                    available_scores.append(('stress', stress.get('score')))
+                
+                if len(available_scores) >= 2:
+                    weights = {"posture": 0.25, "eye_strain": 0.20, "engagement": 0.30, "stress": 0.25}
+                    total_weight = sum(weights.get(name, 0) for name, _ in available_scores)
+                    weighted_sum = sum(score * weights.get(name, 0) for name, score in available_scores)
+                    partial_productivity = weighted_sum / total_weight if total_weight > 0 else None
+                    
+                    if partial_productivity:
+                        productivity = {
+                            "productivity_score": round(partial_productivity, 2),
+                            "break_needed": partial_productivity < 60,
+                            "eye_exercise_needed": eye_strain.get("eye_strain_risk") in ["medium", "high"] if eye_strain else False,
+                            "posture_reminder": posture.get("slouching", False) if posture else False
+                        }
             
-            # Prepare response
+            # Get recommendations - only if we have productivity data
+            recommendations = []
+            if productivity:
+                try:
+                    rec_data = {
+                        **productivity,
+                        "stress_level": stress.get("stress_level", "low") if stress else "low",
+                        "blink_rate": eye_strain.get("blink_rate", 0) if eye_strain else 0
+                    }
+                    recommendations = analyzer.get_recommendations(rec_data)
+                except Exception as e:
+                    logging.error(f"Recommendations error: {e}", exc_info=True)
+                    recommendations = ["⚠️ Analysis in progress - collecting data..."]
+            else:
+                recommendations = ["⚠️ Analysis in progress - collecting data..."]
+            
+            # Prepare response - handle None values gracefully
             response = {
                 "timestamp": datetime.now().isoformat(),
-                "posture": posture,
-                "eye_strain": eye_strain,
-                "engagement": engagement,
-                "stress": stress,
-                "productivity": productivity,
+                "posture": posture if posture else {"error": "No face detected or insufficient data"},
+                "eye_strain": eye_strain if eye_strain else {"error": "Insufficient data for analysis"},
+                "engagement": engagement if engagement else {"error": "Insufficient data for analysis"},
+                "stress": stress if stress else {"error": "Insufficient data for analysis"},
+                "productivity": productivity if productivity else {"error": "Cannot calculate - missing analysis data"},
                 "recommendations": recommendations
             }
             
@@ -2594,7 +2706,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 sessions[session_id]["last_result_time"] = datetime.now()
             
             # Log that we're sending fresh analysis with position data
-            logging.info(f"📤 Sending FRESH analysis via WebSocket - Posture: {posture.get('score')} (face_y: {posture.get('face_position_y'):.3f}), Eye: {eye_strain.get('score')}, Engagement: {engagement.get('score')}, Stress: {stress.get('score')}")
+            # Log that we're sending fresh analysis with position data
+            posture_log = f"{posture.get('score')} (face_y: {posture.get('face_position_y'):.3f})" if posture and posture.get('score') else "N/A"
+            eye_log = eye_strain.get('score') if eye_strain and eye_strain.get('score') else "N/A"
+            engagement_log = engagement.get('score') if engagement and engagement.get('score') else "N/A"
+            stress_log = stress.get('score') if stress and stress.get('score') else "N/A"
+            logging.info(f"📤 Sending FRESH analysis via WebSocket - Posture: {posture_log}, Eye: {eye_log}, Engagement: {engagement_log}, Stress: {stress_log}")
             
             try:
                 await websocket.send_json(response)
