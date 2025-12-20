@@ -4,6 +4,7 @@ import './App.css'
 function App() {
   const [isConnected, setIsConnected] = useState(false)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
+  const [isLoading, setIsLoading] = useState(false)
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   
@@ -88,13 +89,18 @@ function App() {
           return
         }
 
-        canvas.width = video.videoWidth || 640
-        canvas.height = video.videoHeight || 480
-        ctx.drawImage(video, 0, 0)
+        // Performance optimization: Use lower resolution for faster processing
+        const targetWidth = 640
+        const targetHeight = 480
+        canvas.width = targetWidth
+        canvas.height = targetHeight
+        ctx.drawImage(video, 0, 0, targetWidth, targetHeight)
 
-        const imageData = canvas.toDataURL('image/jpeg', 0.7)
+        // Performance: Use lower quality for faster transmission
+        const imageData = canvas.toDataURL('image/jpeg', 0.6)
         
         isSending = true
+        setIsLoading(true)
         try {
           console.log('📤 Sending frame to /analyze...')
           // Use HTTP POST instead of WebSocket
@@ -122,18 +128,19 @@ function App() {
               hasPosture: !!result.posture,
               hasEyeStrain: !!result.eye_strain
             })
-            // Ensure all required fields exist with defaults
+            // Use actual data from backend - no static defaults
             const safeResult = {
               timestamp: result.timestamp || new Date().toISOString(),
-              posture: result.posture || { slouching: false, score: 70 },
-              eye_strain: result.eye_strain || { eye_strain_risk: 'low', score: 100 },
-              engagement: result.engagement || { concentration: 'low', score: 50 },
-              stress: result.stress || { stress_level: 'low', score: 100 },
-              productivity: result.productivity || { productivity_score: 70, break_needed: false },
-              recommendations: result.recommendations || []
+              posture: result.posture || { error: "No data available" },
+              eye_strain: result.eye_strain || { error: "No data available" },
+              engagement: result.engagement || { error: "No data available" },
+              stress: result.stress || { error: "No data available" },
+              productivity: result.productivity || { error: "Cannot calculate - missing data" },
+              recommendations: result.recommendations || ["⚠️ Analysis in progress - collecting data..."]
             }
             setData(safeResult)
             setIsAnalyzing(true)
+            setIsLoading(false)
             setError(null)
           } else {
             const errorText = await response.text()
@@ -142,6 +149,7 @@ function App() {
               statusText: response.statusText,
               body: errorText
             })
+            setIsLoading(false)
             setError(`Analysis failed: ${response.status} ${response.statusText}`)
           }
         } catch (fetchErr) {
@@ -152,6 +160,7 @@ function App() {
             type: fetchErr.constructor.name
           })
           
+          setIsLoading(false)
           // Check if it's a timeout
           if (fetchErr.name === 'TimeoutError' || fetchErr.name === 'AbortError') {
             setError('Request timeout. Backend may be slow or unresponsive.')
@@ -164,7 +173,7 @@ function App() {
           setIsAnalyzing(false)
         } finally {
           isSending = false
-          // Throttle to ~5 FPS (200ms between frames) to reduce backend load
+          // Performance optimization: Throttle to ~5 FPS (200ms between frames) to reduce backend load
           setTimeout(() => {
             animationFrameRef.current = requestAnimationFrame(sendFrame)
           }, 200)
@@ -255,15 +264,15 @@ function App() {
             hasStress: !!response.stress
           })
           
-          // Ensure all required fields exist with defaults
+          // Use actual data from backend - no static defaults
           const safeResponse = {
             timestamp: response.timestamp || new Date().toISOString(),
-            posture: response.posture || { slouching: false, score: 70 },
-            eye_strain: response.eye_strain || { eye_strain_risk: 'low', score: 100 },
-            engagement: response.engagement || { concentration: 'low', score: 50 },
-            stress: response.stress || { stress_level: 'low', score: 100 },
-            productivity: response.productivity || { productivity_score: 70, break_needed: false },
-            recommendations: response.recommendations || []
+            posture: response.posture || { error: "No data available" },
+            eye_strain: response.eye_strain || { error: "No data available" },
+            engagement: response.engagement || { error: "No data available" },
+            stress: response.stress || { error: "No data available" },
+            productivity: response.productivity || { error: "Cannot calculate - missing data" },
+            recommendations: response.recommendations || ["⚠️ Analysis in progress - collecting data..."]
           }
           
           console.log('Full response:', safeResponse)
@@ -475,7 +484,14 @@ function App() {
           )}
         </div>
 
-        {data && data.productivity && (
+        {isLoading && (
+          <div className="loading-indicator">
+            <div className="spinner"></div>
+            <p>Analyzing frame...</p>
+          </div>
+        )}
+
+        {data && data.productivity && !data.productivity.error && (
           <div className="metrics-section">
             <div className="productivity-card">
               <h2>📊 Productivity Score</h2>
@@ -483,56 +499,80 @@ function App() {
                 className="score-display"
                 style={{ color: getScoreColor(data.productivity?.productivity_score || 0) }}
               >
-                {(data.productivity?.productivity_score || 0).toFixed(1)}
+                {data.productivity?.productivity_score ? data.productivity.productivity_score.toFixed(1) : 'N/A'}
               </div>
             </div>
 
             <div className="metrics-grid">
-              {data.posture && (
+              {data.posture && !data.posture.error && (
                 <div className="metric-card">
                   <h3>💺 Posture</h3>
-                  <div className="metric-value" style={{ color: getScoreColor(data.posture?.score || 0) }}>
-                    {(data.posture?.score || 0).toFixed(1)}
-                  </div>
-                  <div className="metric-status">
-                    {data.posture?.slouching ? '⚠️ Slouching detected' : '✅ Good posture'}
-                  </div>
+                  {data.posture.score !== undefined && data.posture.score !== null ? (
+                    <>
+                      <div className="metric-value" style={{ color: getScoreColor(data.posture.score) }}>
+                        {data.posture.score.toFixed(1)}
+                      </div>
+                      <div className="metric-status">
+                        {data.posture.slouching ? '⚠️ Slouching detected' : '✅ Good posture'}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="metric-status">⏳ Calibrating...</div>
+                  )}
                 </div>
               )}
 
-              {data.eye_strain && (
+              {data.eye_strain && !data.eye_strain.error && (
                 <div className="metric-card">
                   <h3>👁️ Eye Strain</h3>
-                  <div className="metric-value" style={{ color: getScoreColor(data.eye_strain?.score || 0) }}>
-                    {(data.eye_strain?.score || 0).toFixed(1)}
-                  </div>
-                  <div className="metric-status">
-                    Risk: {(data.eye_strain?.eye_strain_risk || 'low').toUpperCase()}
-                  </div>
+                  {data.eye_strain.score !== undefined && data.eye_strain.score !== null ? (
+                    <>
+                      <div className="metric-value" style={{ color: getScoreColor(data.eye_strain.score) }}>
+                        {data.eye_strain.score.toFixed(1)}
+                      </div>
+                      <div className="metric-status">
+                        Risk: {(data.eye_strain.eye_strain_risk || 'low').toUpperCase()}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="metric-status">⏳ Calibrating...</div>
+                  )}
                 </div>
               )}
 
-              {data.engagement && (
+              {data.engagement && !data.engagement.error && (
                 <div className="metric-card">
                   <h3>🧠 Engagement</h3>
-                  <div className="metric-value" style={{ color: getScoreColor(data.engagement?.score || 0) }}>
-                    {(data.engagement?.score || 0).toFixed(1)}
-                  </div>
-                  <div className="metric-status">
-                    Concentration: {(data.engagement?.concentration || 'low').toUpperCase()}
-                  </div>
+                  {data.engagement.score !== undefined && data.engagement.score !== null ? (
+                    <>
+                      <div className="metric-value" style={{ color: getScoreColor(data.engagement.score) }}>
+                        {data.engagement.score.toFixed(1)}
+                      </div>
+                      <div className="metric-status">
+                        Concentration: {(data.engagement.concentration || 'low').toUpperCase()}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="metric-status">⏳ Calibrating...</div>
+                  )}
                 </div>
               )}
 
-              {data.stress && (
+              {data.stress && !data.stress.error && (
                 <div className="metric-card">
                   <h3>😌 Stress Level</h3>
-                  <div className="metric-value" style={{ color: getScoreColor(data.stress?.score || 0) }}>
-                    {(data.stress?.score || 0).toFixed(1)}
-                  </div>
-                  <div className="metric-status">
-                    {(data.stress?.stress_level || 'low').toUpperCase()}
-                  </div>
+                  {data.stress.score !== undefined && data.stress.score !== null ? (
+                    <>
+                      <div className="metric-value" style={{ color: getScoreColor(data.stress.score) }}>
+                        {data.stress.score.toFixed(1)}
+                      </div>
+                      <div className="metric-status">
+                        {(data.stress.stress_level || 'low').toUpperCase()}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="metric-status">⏳ Calibrating...</div>
+                  )}
                 </div>
               )}
             </div>

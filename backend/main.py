@@ -11,6 +11,7 @@ from datetime import datetime
 import logging
 import traceback
 from collections import deque
+import time
 
 # Configure logging first
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -239,7 +240,7 @@ class WellnessAnalyzer:
         self.outlier_threshold = 2.5  # Standard deviations for outlier detection
     
     def _calibrate_posture(self):
-        """Calibrate to user's normal posture position"""
+        """Enhanced calibration to user's normal posture with outlier removal"""
         try:
             if len(self.user_calibration["posture_samples"]) < 30:
                 return
@@ -248,28 +249,50 @@ class WellnessAnalyzer:
             if not samples:
                 return
             
-            avg_face_y = np.mean([s["face_y"] for s in samples if "face_y" in s])
-            avg_face_x = np.mean([s["face_x"] for s in samples if "face_x" in s])
-            avg_pitch = np.mean([abs(s["pitch"]) for s in samples if "pitch" in s])
+            # Advanced ML: Use robust statistics (median) instead of mean for better calibration
+            face_y_values = [s["face_y"] for s in samples if "face_y" in s]
+            face_x_values = [s["face_x"] for s in samples if "face_x" in s]
+            pitch_values = [abs(s["pitch"]) for s in samples if "pitch" in s]
+            
+            # Remove outliers using IQR method
+            def remove_outliers(values):
+                if len(values) < 10:
+                    return values
+                q1 = np.percentile(values, 25)
+                q3 = np.percentile(values, 75)
+                iqr = q3 - q1
+                lower = q1 - 1.5 * iqr
+                upper = q3 + 1.5 * iqr
+                return [v for v in values if lower <= v <= upper]
+            
+            face_y_filtered = remove_outliers(face_y_values)
+            face_x_filtered = remove_outliers(face_x_values)
+            pitch_filtered = remove_outliers(pitch_values)
+            
+            # Use median for robustness
+            avg_face_y = np.median(face_y_filtered) if face_y_filtered else np.median(face_y_values)
+            avg_face_x = np.median(face_x_filtered) if face_x_filtered else np.median(face_x_values)
+            avg_pitch = np.median(pitch_filtered) if pitch_filtered else np.median(pitch_values)
             
             # Validate values
             if not (0 <= avg_face_y <= 1 and 0 <= avg_face_x <= 1):
                 logging.warning(f"Invalid calibration values: face_y={avg_face_y}, face_x={avg_face_x}")
                 return
             
-            # Store user's baseline
+            # Store user's baseline with std for adaptive thresholds
             self.user_calibration["baseline_face_y"] = avg_face_y
             self.user_calibration["baseline_face_x"] = avg_face_x
             self.user_calibration["baseline_pitch"] = avg_pitch
+            self.user_calibration["baseline_face_y_std"] = np.std(face_y_filtered) if len(face_y_filtered) > 1 else 0.05
             self.user_calibration["calibrated"] = True
             self.user_calibration["calibration_time"] = datetime.now()
             
-            logging.info(f"User posture calibrated: face_y={avg_face_y:.3f}, face_x={avg_face_x:.3f}, pitch={avg_pitch:.2f}")
+            logging.info(f"User posture calibrated (robust): face_y={avg_face_y:.3f}±{self.user_calibration['baseline_face_y_std']:.3f}, face_x={avg_face_x:.3f}, pitch={avg_pitch:.2f}")
         except Exception as e:
             logging.error(f"Error in posture calibration: {e}", exc_info=True)
     
     def _calibrate_ear(self):
-        """Calibrate to user's normal EAR"""
+        """Enhanced calibration to user's normal EAR with outlier removal"""
         try:
             if len(self.user_calibration["ear_samples"]) < 50:
                 return
@@ -278,8 +301,24 @@ class WellnessAnalyzer:
             if not samples:
                 return
             
-            self.ear_baseline = np.mean(samples)
-            self.ear_std = np.std(samples)
+            # Advanced ML: Remove outliers using IQR method for better calibration
+            q1 = np.percentile(samples, 25)
+            q3 = np.percentile(samples, 75)
+            iqr = q3 - q1
+            lower_bound = q1 - 1.5 * iqr
+            upper_bound = q3 + 1.5 * iqr
+            
+            # Filter outliers
+            filtered_samples = [s for s in samples if lower_bound <= s <= upper_bound]
+            
+            if len(filtered_samples) < 30:
+                # If too many outliers, use all samples
+                filtered_samples = samples
+            
+            # Use robust statistics: median for baseline, MAD for std
+            self.ear_baseline = np.median(filtered_samples)
+            mad = np.median([abs(s - self.ear_baseline) for s in filtered_samples])
+            self.ear_std = 1.4826 * mad if mad > 0 else 0.03  # Convert MAD to std estimate
             
             # Validate values
             if not (0.15 <= self.ear_baseline <= 0.40):
@@ -291,7 +330,7 @@ class WellnessAnalyzer:
             if self.ear_std <= 0:
                 self.ear_std = 0.03  # Default std if too small
             
-            logging.info(f"User EAR calibrated: baseline={self.ear_baseline:.3f}, std={self.ear_std:.3f}")
+            logging.info(f"User EAR calibrated (outlier-robust): baseline={self.ear_baseline:.3f}, std={self.ear_std:.3f}, samples={len(filtered_samples)}/{len(samples)}")
         except Exception as e:
             logging.error(f"Error in EAR calibration: {e}", exc_info=True)
     
@@ -781,13 +820,6 @@ class WellnessAnalyzer:
         horizontal_offset = abs(face_center_x - 0.5)
         horizontal_penalty = min(30, horizontal_offset * 60)  # More sensitive (was 50)
         
-        # Calculate overall posture score with dynamic weighting
-        # Make vertical position MUCH more important (70% weight) for maximum responsiveness
-        base_score = (pitch_score * 0.20 + vertical_score * 0.70 + (100 - horizontal_penalty) * 0.10)
-        posture_score = base_score - roll_penalty * 0.20
-        # Ensure scores vary significantly with position changes
-        posture_score = max(15, min(100, posture_score))
-        
         # DIRECTLY map face position to score for maximum responsiveness
         # This ensures ANY position change is immediately reflected
         # Use face_center_y directly - no complex calculations
@@ -804,6 +836,38 @@ class WellnessAnalyzer:
             position_based_score = 100 - abs(y_diff) * 350
         
         position_based_score = max(15, min(100, position_based_score))
+        
+        # Advanced ML: Ensemble method - combine multiple scoring approaches
+        # Approach 1: Weighted combination
+        base_score = (pitch_score * 0.20 + vertical_score * 0.70 + (100 - horizontal_penalty) * 0.10)
+        ensemble_score_1 = base_score - roll_penalty * 0.20
+        
+        # Approach 2: Position-based direct mapping (calculated above)
+        ensemble_score_2 = position_based_score
+        
+        # Approach 3: Adaptive threshold-based scoring (if calibrated)
+        ensemble_score_3 = vertical_score
+        if self.user_calibration.get("calibrated", False):
+            baseline_y = self.user_calibration.get("baseline_face_y", 0.35)
+            baseline_std = self.user_calibration.get("baseline_face_y_std", 0.05)
+            deviation = abs(face_center_y - baseline_y)
+            # Score based on deviation from personal baseline
+            if deviation < baseline_std:
+                ensemble_score_3 = 100 - (deviation / baseline_std) * 20  # Excellent
+            elif deviation < 2 * baseline_std:
+                ensemble_score_3 = 80 - ((deviation - baseline_std) / baseline_std) * 30  # Good
+            else:
+                ensemble_score_3 = 50 - ((deviation - 2 * baseline_std) / baseline_std) * 35  # Poor
+        
+        # Ensemble: Weighted average of all approaches
+        # Give more weight to calibrated approach if available
+        if self.user_calibration.get("calibrated", False):
+            posture_score = (ensemble_score_1 * 0.30 + ensemble_score_2 * 0.30 + ensemble_score_3 * 0.40)
+        else:
+            posture_score = (ensemble_score_1 * 0.40 + ensemble_score_2 * 0.60)
+        
+        # Ensure scores vary significantly with position changes
+        posture_score = max(15, min(100, posture_score))
         
         # Use 80% position-based score for maximum responsiveness
         posture_score = position_based_score * 0.80 + posture_score * 0.20
@@ -2066,7 +2130,7 @@ def detect_face_mtcnn(image: np.ndarray) -> Tuple[Optional, Optional, Optional]:
         logging.error(f"Error in MTCNN detection: {e}", exc_info=True)
         return None, None, None
 
-def detect_face_mediapipe(image: np.ndarray) -> Tuple[Optional, Optional, Optional]:
+def detect_face_mediapipe(image: np.ndarray, use_cache: bool = True) -> Tuple[Optional, Optional, Optional]:
     """Detect face and landmarks using best available method (MediaPipe > dlib > face_recognition > MTCNN > OpenCV)"""
     # Try methods in order of accuracy
     if MEDIAPIPE_AVAILABLE:
@@ -2095,7 +2159,15 @@ def detect_face_mediapipe(image: np.ndarray) -> Tuple[Optional, Optional, Option
             if not landmarks:
                 logging.warning("⚠️ MediaPipe detected face but no landmarks - trying alternatives")
             else:
-                return face_results, landmarks, mesh_results
+                result = (face_results, landmarks, mesh_results)
+                # Cache result
+                if use_cache:
+                    try:
+                        from cache import face_detection_cache
+                        face_detection_cache.set(image, result)
+                    except ImportError:
+                        pass
+                return result
         except Exception as e:
             logging.error(f"Error in MediaPipe detection: {e}", exc_info=True)
     
@@ -2135,7 +2207,7 @@ def detect_face_mediapipe(image: np.ndarray) -> Tuple[Optional, Optional, Option
     return detect_face_opencv(image)
 
 def decode_image(image_data: str) -> np.ndarray:
-    """Decode base64 image"""
+    """Decode base64 image with performance optimization"""
     try:
         # Handle data URL format
         if ',' in image_data:
@@ -2149,6 +2221,13 @@ def decode_image(image_data: str) -> np.ndarray:
         if image is None:
             raise ValueError("Failed to decode image")
         
+        # Performance optimization: Compress if too large
+        h, w = image.shape[:2]
+        if max(h, w) > 640:
+            scale = 640 / max(h, w)
+            image = cv2.resize(image, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+            logging.debug(f"Compressed image from {w}x{h} to {int(w*scale)}x{int(h*scale)}")
+        
         return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     except Exception as e:
         logging.error(f"Error decoding image: {e}", exc_info=True)
@@ -2160,26 +2239,48 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    """Health check endpoint with detailed metrics"""
+    try:
+        from metrics import metrics
+        health_data = metrics.get_health()
+        return health_data
+    except ImportError:
+        return {"status": "healthy", "message": "Metrics not available"}
+    
+@app.get("/metrics")
+async def get_metrics():
+    """Get detailed metrics"""
+    try:
+        from metrics import metrics
+        return metrics.get_stats()
+    except ImportError:
+        return {"error": "Metrics not available"}
 
 @app.post("/analyze")
 async def analyze_frame(request: AnalyzeRequest):
     """HTTP endpoint for frame analysis (alternative to WebSocket)"""
+    start_time = time.time()
     try:
+        # Record request
+        try:
+            from metrics import metrics
+            metrics.record_request("analyze")
+        except ImportError:
+            pass
         image_data = request.image
         if not image_data:
             logging.warning("No image data provided")
             return JSONResponse(
-                status_code=200,
+                status_code=400,
                 content={
                     "error": "No image data provided",
                     "timestamp": datetime.now().isoformat(),
-                    "posture": {"slouching": False, "score": 70},
-                    "eye_strain": {"eye_strain_risk": "low", "score": 100},
-                    "engagement": {"concentration": "low", "score": 50},
-                    "stress": {"stress_level": "low", "score": 100},
-                    "productivity": {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False},
-                    "recommendations": ["⚠️ No image data"]
+                    "posture": {"error": "No image data provided"},
+                    "eye_strain": {"error": "No image data provided"},
+                    "engagement": {"error": "No image data provided"},
+                    "stress": {"error": "No image data provided"},
+                    "productivity": {"error": "Cannot calculate - no image data"},
+                    "recommendations": ["⚠️ Please provide image data"]
                 }
             )
         
@@ -2193,37 +2294,40 @@ async def analyze_frame(request: AnalyzeRequest):
             # Preprocess image for better face detection accuracy
             image = analyzer.preprocess_image(image)
             
+            # Performance: Record processing start time
+            processing_start = time.time()
+            
             # Validate image quality before processing
             quality_check = analyzer.validate_image_quality(image)
             if not quality_check.get("valid", True):
                 logging.warning(f"Poor image quality: {quality_check.get('reason')}")
                 return JSONResponse(
-                    status_code=200,
+                    status_code=400,
                     content={
                         "error": f"Image quality too poor: {quality_check.get('reason')}",
                         "quality_score": quality_check.get("quality_score", 0),
                         "timestamp": datetime.now().isoformat(),
-                        "posture": {"slouching": False, "score": 70},
-                        "eye_strain": {"eye_strain_risk": "low", "score": 100},
-                        "engagement": {"concentration": "low", "score": 50},
-                        "stress": {"stress_level": "low", "score": 100},
-                        "productivity": {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False},
+                        "posture": {"error": f"Image quality issue: {quality_check.get('reason')}"},
+                        "eye_strain": {"error": f"Image quality issue: {quality_check.get('reason')}"},
+                        "engagement": {"error": f"Image quality issue: {quality_check.get('reason')}"},
+                        "stress": {"error": f"Image quality issue: {quality_check.get('reason')}"},
+                        "productivity": {"error": "Cannot calculate - poor image quality"},
                         "recommendations": [f"⚠️ Image quality issue: {quality_check.get('reason')}. Please improve lighting or camera focus."]
                     }
                 )
         except Exception as decode_err:
             logging.error(f"Error decoding image: {decode_err}", exc_info=True)
             return JSONResponse(
-                status_code=200,
+                status_code=400,
                 content={
                     "error": f"Image decode error: {str(decode_err)}",
                     "timestamp": datetime.now().isoformat(),
-                    "posture": {"slouching": False, "score": 70},
-                    "eye_strain": {"eye_strain_risk": "low", "score": 100},
-                    "engagement": {"concentration": "low", "score": 50},
-                    "stress": {"stress_level": "low", "score": 100},
-                    "productivity": {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False},
-                    "recommendations": ["⚠️ Image decode failed"]
+                    "posture": {"error": "Image decode error"},
+                    "eye_strain": {"error": "Image decode error"},
+                    "engagement": {"error": "Image decode error"},
+                    "stress": {"error": "Image decode error"},
+                    "productivity": {"error": "Cannot calculate - image decode error"},
+                    "recommendations": ["⚠️ Image decode error. Please check image format."]
                 }
             )
         
@@ -2463,6 +2567,23 @@ async def analyze_frame(request: AnalyzeRequest):
         stress_log = stress.get('score') if stress and stress.get('score') else "N/A"
         logging.info(f"📤 Sending FRESH analysis - Posture: {posture_log}, Eye: {eye_log}, Engagement: {engagement_log}, Stress: {stress_log}")
         
+        # Record performance metrics
+        try:
+            from metrics import metrics
+            total_time = time.time() - start_time
+            metrics.record_success("analyze", total_time)
+            
+            # Calculate analysis time if analysis_start was set
+            if 'analysis_start' in locals():
+                analysis_time = (time.time() - analysis_start) * 1000  # Convert to ms
+                metrics.record_analysis_time(analysis_time)
+            # Calculate frame processing time if processing_start was set
+            if 'processing_start' in locals():
+                frame_processing_time = (time.time() - processing_start) * 1000  # Convert to ms
+                metrics.record_frame_processing_time(frame_processing_time)
+        except ImportError:
+            pass
+        
         return JSONResponse(content=response, status_code=200)
         
     except Exception as e:
@@ -2470,17 +2591,25 @@ async def analyze_frame(request: AnalyzeRequest):
         import traceback
         error_trace = traceback.format_exc()
         logging.error(f"Full traceback: {error_trace}")
+        
+        # Record error metrics
+        try:
+            from metrics import metrics
+            metrics.record_error("analyze", type(e).__name__)
+        except ImportError:
+            pass
+        
         return JSONResponse(
-            status_code=200,
+            status_code=500,
             content={
                 "error": str(e),
                 "timestamp": datetime.now().isoformat(),
-                "posture": {"slouching": False, "score": 70},
-                "eye_strain": {"eye_strain_risk": "low", "score": 100},
-                "engagement": {"concentration": "low", "score": 50},
-                "stress": {"stress_level": "low", "score": 100},
-                "productivity": {"productivity_score": 70, "break_needed": False, "eye_exercise_needed": False, "posture_reminder": False},
-                "recommendations": ["⚠️ Analysis error occurred"]
+                "posture": {"error": "Analysis error occurred"},
+                "eye_strain": {"error": "Analysis error occurred"},
+                "engagement": {"error": "Analysis error occurred"},
+                "stress": {"error": "Analysis error occurred"},
+                "productivity": {"error": "Cannot calculate - analysis error"},
+                "recommendations": ["⚠️ Analysis error occurred. Please try again."]
             }
         )
 
@@ -2547,8 +2676,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Preprocess image for better face detection accuracy
                 image = analyzer.preprocess_image(image)
                 
-                # Detect face and landmarks using MediaPipe
-                face_results, landmarks, mesh_results = detect_face_mediapipe(image)
+                # Detect face and landmarks using MediaPipe (with caching)
+                face_results, landmarks, mesh_results = detect_face_mediapipe(image, use_cache=True)
             except Exception as e:
                 logging.error(f"Image processing error: {e}", exc_info=True)
                 # Send error response but keep connection alive
@@ -2581,6 +2710,9 @@ async def websocket_endpoint(websocket: WebSocket):
             
             ear_history, head_position_history = get_session_history(session_id)
             
+            # Performance: Record processing start time
+            processing_start = time.time()
+            
             # Adapt to current conditions
             try:
                 analyzer._adapt_to_lighting(image)
@@ -2588,6 +2720,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 logging.warning(f"Lighting adaptation error: {e}")
             
             # Analyze with error handling - no static defaults
+            analysis_start = time.time()
             posture = None
             try:
                 posture = analyzer.analyze_posture(image, landmarks, face_results)
@@ -2712,6 +2845,18 @@ async def websocket_endpoint(websocket: WebSocket):
             engagement_log = engagement.get('score') if engagement and engagement.get('score') else "N/A"
             stress_log = stress.get('score') if stress and stress.get('score') else "N/A"
             logging.info(f"📤 Sending FRESH analysis via WebSocket - Posture: {posture_log}, Eye: {eye_log}, Engagement: {engagement_log}, Stress: {stress_log}")
+            
+            # Record performance metrics
+            try:
+                from metrics import metrics
+                if 'analysis_start' in locals():
+                    analysis_time = (time.time() - analysis_start) * 1000
+                    metrics.record_analysis_time(analysis_time)
+                if 'processing_start' in locals():
+                    frame_processing_time = (time.time() - processing_start) * 1000
+                    metrics.record_frame_processing_time(frame_processing_time)
+            except ImportError:
+                pass
             
             try:
                 await websocket.send_json(response)
