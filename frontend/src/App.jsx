@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
+import { analyzeFrame } from './utils/api'
 
 function App() {
   const [isConnected, setIsConnected] = useState(false)
@@ -7,6 +8,14 @@ function App() {
   const [isLoading, setIsLoading] = useState(false)
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
+  const [darkMode, setDarkMode] = useState(() => {
+    // Load from localStorage or default to false
+    const saved = localStorage.getItem('darkMode')
+    return saved ? JSON.parse(saved) : false
+  })
+  const [showSettings, setShowSettings] = useState(false)
+  const [sessionStartTime, setSessionStartTime] = useState(null)
+  const [sessionDuration, setSessionDuration] = useState(0)
   
   const videoRef = useRef(null)
   const canvasRef = useRef(null)
@@ -20,6 +29,99 @@ function App() {
   useEffect(() => {
     isConnectedRef.current = isConnected
   }, [isConnected])
+
+  // Update dark mode class on body
+  useEffect(() => {
+    if (darkMode) {
+      document.body.classList.add('dark-mode')
+    } else {
+      document.body.classList.remove('dark-mode')
+    }
+    localStorage.setItem('darkMode', JSON.stringify(darkMode))
+  }, [darkMode])
+
+  // Session timer
+  useEffect(() => {
+    let interval = null
+    if (isConnected && sessionStartTime) {
+      interval = setInterval(() => {
+        setSessionDuration(Math.floor((Date.now() - sessionStartTime) / 1000))
+      }, 1000)
+    } else if (!isConnected) {
+      setSessionDuration(0)
+      setSessionStartTime(null)
+    }
+    return () => {
+      if (interval) clearInterval(interval)
+    }
+  }, [isConnected, sessionStartTime])
+
+  // Format session duration
+  const formatDuration = (seconds) => {
+    const mins = Math.floor(seconds / 60)
+    const secs = seconds % 60
+    return `${mins}:${secs.toString().padStart(2, '0')}`
+  }
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyPress = (e) => {
+      // Space to start/stop (when not in input)
+      if (e.code === 'Space' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA') {
+        e.preventDefault()
+        if (isConnected) {
+          stopCamera()
+        } else {
+          startCamera()
+        }
+      }
+      // Escape to close settings
+      if (e.code === 'Escape' && showSettings) {
+        setShowSettings(false)
+      }
+      // 'E' to export data
+      if (e.code === 'KeyE' && e.target.tagName !== 'INPUT' && data && data.productivity && !data.productivity.error) {
+        exportData()
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyPress)
+    return () => window.removeEventListener('keydown', handleKeyPress)
+  }, [isConnected, showSettings, data, stopCamera, exportData])
+
+  // Export data function
+  const exportData = useCallback(() => {
+    if (!data) return
+    
+    const exportData = {
+      timestamp: new Date().toISOString(),
+      session_duration: formatDuration(sessionDuration),
+      productivity: data.productivity,
+      posture: data.posture,
+      eye_strain: data.eye_strain,
+      engagement: data.engagement,
+      stress: data.stress,
+      recommendations: data.recommendations
+    }
+
+    // Create CSV
+    const csvRows = []
+    csvRows.push(['Metric', 'Value', 'Status'])
+    csvRows.push(['Productivity Score', data.productivity?.productivity_score || 'N/A', ''])
+    csvRows.push(['Posture Score', data.posture?.score || 'N/A', data.posture?.slouching ? 'Slouching' : 'Good'])
+    csvRows.push(['Eye Strain Score', data.eye_strain?.score || 'N/A', data.eye_strain?.eye_strain_risk || 'N/A'])
+    csvRows.push(['Engagement Score', data.engagement?.score || 'N/A', data.engagement?.concentration || 'N/A'])
+    csvRows.push(['Stress Score', data.stress?.score || 'N/A', data.stress?.stress_level || 'N/A'])
+    
+    const csv = csvRows.map(row => row.join(',')).join('\n')
+    const blob = new Blob([csv], { type: 'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `neuro_desk_${new Date().toISOString().split('T')[0]}.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+  }, [data, sessionDuration])
 
   // Debug: Log when data changes
   useEffect(() => {
@@ -103,72 +205,39 @@ function App() {
         setIsLoading(true)
         try {
           console.log('📤 Sending frame to /analyze...')
-          // Use HTTP POST instead of WebSocket
-          // Use relative URL to go through Vite proxy (avoids CORS issues)
-          const response = await fetch('/analyze', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ image: imageData })
-          })
-          console.log('📥 Response received:', response.status, response.statusText)
           
-          if (response.ok) {
-            const result = await response.json()
-            // Validate response has required fields
-            if (!result || typeof result !== 'object') {
-              console.error('❌ Invalid response format:', result)
-              setError('Invalid response from server')
-              return
-            }
-            console.log('✅ Received analysis data via HTTP:', {
-              timestamp: result.timestamp || 'N/A',
-              productivity: result.productivity?.productivity_score || 'N/A',
-              hasPosture: !!result.posture,
-              hasEyeStrain: !!result.eye_strain
-            })
-            // Use actual data from backend - no static defaults
-            const safeResult = {
-              timestamp: result.timestamp || new Date().toISOString(),
-              posture: result.posture || { error: "No data available" },
-              eye_strain: result.eye_strain || { error: "No data available" },
-              engagement: result.engagement || { error: "No data available" },
-              stress: result.stress || { error: "No data available" },
-              productivity: result.productivity || { error: "Cannot calculate - missing data" },
-              recommendations: result.recommendations || ["⚠️ Analysis in progress - collecting data..."]
-            }
-            setData(safeResult)
-            setIsAnalyzing(true)
-            setIsLoading(false)
-            setError(null)
-          } else {
-            const errorText = await response.text()
-            console.error('❌ HTTP request failed:', {
-              status: response.status,
-              statusText: response.statusText,
-              body: errorText
-            })
-            setIsLoading(false)
-            setError(`Analysis failed: ${response.status} ${response.statusText}`)
+          // Use improved API utility with timeout and retry
+          const result = await analyzeFrame(imageData, (attempt, maxRetries, delay) => {
+            console.log(`🔄 Retrying request (${attempt}/${maxRetries}) after ${delay}ms...`)
+          })
+          
+          console.log('✅ Received analysis data via HTTP:', {
+            timestamp: result.timestamp || 'N/A',
+            productivity: result.productivity?.productivity_score || 'N/A',
+            hasPosture: !!result.posture,
+            hasEyeStrain: !!result.eye_strain
+          })
+          
+          // Use actual data from backend - no static defaults
+          const safeResult = {
+            timestamp: result.timestamp || new Date().toISOString(),
+            posture: result.posture || { error: "No data available" },
+            eye_strain: result.eye_strain || { error: "No data available" },
+            engagement: result.engagement || { error: "No data available" },
+            stress: result.stress || { error: "No data available" },
+            productivity: result.productivity || { error: "Cannot calculate - missing data" },
+            recommendations: result.recommendations || ["⚠️ Analysis in progress - collecting data..."]
           }
+          setData(safeResult)
+          setIsAnalyzing(true)
+          setIsLoading(false)
+          setError(null)
         } catch (fetchErr) {
           console.error('❌ Error sending frame via HTTP:', fetchErr)
-          console.error('Error details:', {
-            message: fetchErr.message,
-            name: fetchErr.name,
-            type: fetchErr.constructor.name
-          })
           
           setIsLoading(false)
-          // Check if it's a timeout
-          if (fetchErr.name === 'TimeoutError' || fetchErr.name === 'AbortError') {
-            setError('Request timeout. Backend may be slow or unresponsive.')
-          } else if (fetchErr.message.includes('Failed to fetch') || fetchErr.message.includes('NetworkError') || fetchErr.message.includes('ERR_CONNECTION_REFUSED')) {
-            setError('Cannot connect to backend. Make sure backend is running on http://localhost:8000')
-          } else {
-            setError(`Connection error: ${fetchErr.message || 'Unknown error'}`)
-          }
+          // Set user-friendly error message
+          setError(fetchErr.message || 'Failed to analyze frame. Please try again.')
           // Don't clear data on error - keep showing last results
           setIsAnalyzing(false)
         } finally {
@@ -388,6 +457,7 @@ function App() {
       }
       
       setIsConnected(true)
+      setSessionStartTime(Date.now())
       // Small delay to ensure video is fully ready and rendered before connecting WebSocket
       setTimeout(() => {
         if (connectWebSocketRef.current) {
@@ -417,6 +487,8 @@ function App() {
     setIsAnalyzing(false)
     setData(null)
     setError(null)
+    setSessionStartTime(null)
+    setSessionDuration(0)
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current)
       reconnectTimeoutRef.current = null
@@ -438,9 +510,61 @@ function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1>🤖 AI Human-Computer Interaction Coach</h1>
-        <p>Real-time wellness monitoring for your workspace</p>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+          <div>
+            <h1>🤖 AI Human-Computer Interaction Coach</h1>
+            <p>Real-time wellness monitoring for your workspace</p>
+          </div>
+          <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+            {isConnected && sessionDuration > 0 && (
+              <div style={{ 
+                background: 'rgba(59, 130, 246, 0.2)', 
+                padding: '8px 16px', 
+                borderRadius: '8px',
+                fontSize: '0.9rem',
+                color: '#60a5fa'
+              }}>
+                ⏱️ {formatDuration(sessionDuration)}
+              </div>
+            )}
+            <button
+              onClick={() => setDarkMode(!darkMode)}
+              className="theme-toggle"
+              title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+            >
+              {darkMode ? '☀️' : '🌙'}
+            </button>
+            <button
+              onClick={() => setShowSettings(!showSettings)}
+              className="settings-button"
+              title="Settings"
+            >
+              ⚙️
+            </button>
+          </div>
+        </div>
       </header>
+
+      {showSettings && (
+        <div className="settings-panel">
+          <div className="settings-content">
+            <h3>Settings</h3>
+            <div className="settings-item">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={darkMode}
+                  onChange={(e) => setDarkMode(e.target.checked)}
+                />
+                Dark Mode
+              </label>
+            </div>
+            <button onClick={() => setShowSettings(false)} className="close-settings">
+              Close
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="container">
         <div className="camera-section">
@@ -588,11 +712,18 @@ function App() {
               </div>
             )}
 
-            {isConnected && (
-              <button onClick={stopCamera} className="stop-button">
-                🛑 Stop Analysis
-              </button>
-            )}
+            <div style={{ display: 'flex', gap: '10px', marginTop: '20px' }}>
+              {isConnected && (
+                <button onClick={stopCamera} className="stop-button">
+                  🛑 Stop Analysis
+                </button>
+              )}
+              {data && data.productivity && !data.productivity.error && (
+                <button onClick={exportData} className="export-button">
+                  📥 Export Data
+                </button>
+              )}
+            </div>
           </div>
         )}
       </div>

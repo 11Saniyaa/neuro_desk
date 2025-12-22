@@ -1,0 +1,160 @@
+/**
+ * API utility with timeout, retry logic, and better error handling
+ */
+
+const DEFAULT_TIMEOUT = 10000; // 10 seconds
+const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_RETRY_DELAY = 1000; // 1 second base delay
+
+/**
+ * Sleep for specified milliseconds
+ */
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Calculate exponential backoff delay
+ */
+const getRetryDelay = (attempt, baseDelay = DEFAULT_RETRY_DELAY) => {
+  return baseDelay * Math.pow(2, attempt);
+};
+
+/**
+ * Fetch with timeout and abort controller
+ */
+const fetchWithTimeout = async (url, options = {}, timeout = DEFAULT_TIMEOUT) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      throw new Error('Request timeout - server took too long to respond');
+    }
+    throw error;
+  }
+};
+
+/**
+ * Retry fetch with exponential backoff
+ */
+export const fetchWithRetry = async (
+  url,
+  options = {},
+  {
+    maxRetries = DEFAULT_MAX_RETRIES,
+    timeout = DEFAULT_TIMEOUT,
+    retryDelay = DEFAULT_RETRY_DELAY,
+    retryableStatuses = [408, 429, 500, 502, 503, 504],
+    onRetry = null
+  } = {}
+) => {
+  let lastError;
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, options, timeout);
+      
+      // If successful or non-retryable error, return immediately
+      if (response.ok || !retryableStatuses.includes(response.status)) {
+        return response;
+      }
+      
+      // If retryable error and not last attempt
+      if (attempt < maxRetries) {
+        const delay = getRetryDelay(attempt, retryDelay);
+        if (onRetry) {
+          onRetry(attempt + 1, maxRetries, delay);
+        }
+        await sleep(delay);
+        continue;
+      }
+      
+      return response;
+    } catch (error) {
+      lastError = error;
+      
+      // Don't retry on abort/timeout if it's the last attempt
+      if (attempt < maxRetries && error.name !== 'AbortError') {
+        const delay = getRetryDelay(attempt, retryDelay);
+        if (onRetry) {
+          onRetry(attempt + 1, maxRetries, delay);
+        }
+        await sleep(delay);
+        continue;
+      }
+      
+      // Last attempt failed
+      if (attempt === maxRetries) {
+        throw error;
+      }
+    }
+  }
+  
+  throw lastError;
+};
+
+/**
+ * Analyze frame with improved error handling
+ */
+export const analyzeFrame = async (imageData, onRetry = null) => {
+  try {
+    const response = await fetchWithRetry(
+      '/analyze',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ image: imageData })
+      },
+      {
+        maxRetries: 2, // Fewer retries for real-time analysis
+        timeout: 8000, // 8 seconds timeout
+        retryDelay: 500, // Faster retry for real-time
+        onRetry
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      let errorMessage = `Server error: ${response.status}`;
+      
+      try {
+        const errorJson = JSON.parse(errorText);
+        errorMessage = errorJson.error || errorMessage;
+      } catch {
+        errorMessage = errorText || errorMessage;
+      }
+      
+      throw new Error(errorMessage);
+    }
+
+    const result = await response.json();
+    
+    // Validate response structure
+    if (!result || typeof result !== 'object') {
+      throw new Error('Invalid response format from server');
+    }
+
+    return result;
+  } catch (error) {
+    // Provide user-friendly error messages
+    if (error.message.includes('timeout')) {
+      throw new Error('Request timeout - the server is taking too long to respond. Please check your connection.');
+    } else if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
+      throw new Error('Cannot connect to server. Make sure the backend is running on http://localhost:8000');
+    } else if (error.message.includes('AbortError')) {
+      throw new Error('Request was cancelled or timed out');
+    } else {
+      throw error;
+    }
+  }
+};
+

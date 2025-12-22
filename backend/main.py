@@ -161,7 +161,31 @@ if not MEDIAPIPE_AVAILABLE and not MTCNN_AVAILABLE and not DLIB_AVAILABLE and no
         face_cascade_profile = None
         FACE_DETECTOR_DNN = None
 
-app = FastAPI(title="HCI Coach API")
+app = FastAPI(
+    title="Neuro Desk - AI Human-Computer Interaction Coach API",
+    description="""
+    Real-time wellness monitoring system that analyzes workspace behavior using computer vision.
+    
+    ## Features
+    
+    * **Productivity Score** - Real-time productivity tracking
+    * **Posture Detection** - Monitors slouching and sitting position
+    * **Eye Strain Analysis** - Tracks eye strain risk levels
+    * **Engagement Monitoring** - Measures concentration levels
+    * **Stress Detection** - Analyzes stress indicators
+    * **Smart Recommendations** - Personalized wellness suggestions
+    
+    ## Endpoints
+    
+    * `POST /analyze` - Analyze a single frame (HTTP)
+    * `WS /ws` - WebSocket endpoint for real-time analysis
+    * `GET /health` - Health check endpoint
+    * `GET /metrics` - System metrics and statistics
+    """,
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -2339,13 +2363,21 @@ def decode_image(image_data: str) -> np.ndarray:
         logging.error(f"Error decoding image: {e}", exc_info=True)
         raise
 
-@app.get("/")
+@app.get("/", tags=["General"])
 async def root():
-    return {"message": "HCI Coach API", "status": "running"}
+    """Root endpoint - API information"""
+    return {
+        "message": "Neuro Desk - AI Human-Computer Interaction Coach API",
+        "status": "running",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "health": "/health",
+        "metrics": "/metrics"
+    }
 
-@app.get("/health")
+@app.get("/health", tags=["General"])
 async def health():
-    """Health check endpoint with detailed metrics"""
+    """Health check endpoint - returns API health status and detailed metrics"""
     try:
         from metrics import metrics
         health_data = metrics.get_health()
@@ -2353,8 +2385,9 @@ async def health():
     except ImportError:
         return {"status": "healthy", "message": "Metrics not available"}
     
-@app.get("/metrics")
+@app.get("/metrics", tags=["General"])
 async def get_metrics():
+    """Get system metrics and performance statistics"""
     """Get detailed metrics"""
     try:
         from metrics import metrics
@@ -2362,9 +2395,30 @@ async def get_metrics():
     except ImportError:
         return {"error": "Metrics not available"}
 
-@app.post("/analyze")
+@app.post("/analyze", tags=["Analysis"], response_model=Dict)
 async def analyze_frame(request: AnalyzeRequest):
-    """HTTP endpoint for frame analysis (alternative to WebSocket)"""
+    """
+    Analyze a single frame for wellness metrics.
+    
+    **Request Body:**
+    - `image`: Base64 encoded image data (JPEG/PNG)
+    
+    **Response:**
+    - `timestamp`: Analysis timestamp
+    - `posture`: Posture analysis results
+    - `eye_strain`: Eye strain analysis results
+    - `engagement`: Engagement analysis results
+    - `stress`: Stress analysis results
+    - `productivity`: Overall productivity score
+    - `recommendations`: List of wellness recommendations
+    
+    **Example:**
+    ```json
+    {
+      "image": "data:image/jpeg;base64,/9j/4AAQSkZJRg..."
+    }
+    ```
+    """
     start_time = time.time()
     try:
         # Record request
@@ -2719,8 +2773,16 @@ async def analyze_frame(request: AnalyzeRequest):
             }
         )
 
-@app.websocket("/ws")
+@app.websocket("/ws", tags=["Analysis"])
 async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time frame analysis.
+    
+    **Connection:**
+    - Connect to `ws://localhost:8000/ws`
+    - Send frames as JSON: `{"image": "data:image/jpeg;base64,..."}`
+    - Receive analysis results in real-time
+    """
     session_id = None
     try:
         await websocket.accept()
