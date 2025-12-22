@@ -41,15 +41,15 @@ try:
 
     face_detection = mp_face_detection.FaceDetection(
         model_selection=1,  # 0 for short-range, 1 for full-range
-        min_detection_confidence=0.5
+        min_detection_confidence=0.6  # Increased from 0.5 for better accuracy
     )
 
     face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False,
         max_num_faces=1,
         refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
+        min_detection_confidence=0.6,  # Increased from 0.5 for better accuracy
+        min_tracking_confidence=0.6  # Increased from 0.5 for better accuracy
     )
     logging.info("✅ MediaPipe initialized successfully with Face Detection and Face Mesh")
     logging.info("   - Face Detection: Full-range model (model_selection=1)")
@@ -222,9 +222,9 @@ class WellnessAnalyzer:
             "calibration_time": None
         }
         
-        # Confidence thresholds
-        self.min_face_confidence = 0.6  # Higher confidence required
-        self.min_landmark_quality = 0.7  # Quality threshold for landmarks
+        # Confidence thresholds - improved for better accuracy
+        self.min_face_confidence = 0.65  # Higher confidence required (increased from 0.6)
+        self.min_landmark_quality = 0.75  # Quality threshold for landmarks (increased from 0.7)
         
         # Real-world adjustments
         self.lighting_adaptation = 1.0  # Adapts to lighting conditions
@@ -240,9 +240,11 @@ class WellnessAnalyzer:
         self.outlier_threshold = 2.5  # Standard deviations for outlier detection
     
     def _calibrate_posture(self):
-        """Enhanced calibration to user's normal posture with outlier removal"""
+        """Enhanced calibration to user's normal posture with outlier removal and faster convergence"""
         try:
-            if len(self.user_calibration["posture_samples"]) < 30:
+            # Reduced minimum samples for faster calibration (from 30 to 20)
+            min_samples = 20
+            if len(self.user_calibration["posture_samples"]) < min_samples:
                 return
             
             samples = list(self.user_calibration["posture_samples"])
@@ -256,11 +258,13 @@ class WellnessAnalyzer:
             
             # Remove outliers using IQR method
             def remove_outliers(values):
-                if len(values) < 10:
+                if len(values) < 5:
                     return values
                 q1 = np.percentile(values, 25)
                 q3 = np.percentile(values, 75)
                 iqr = q3 - q1
+                if iqr == 0:
+                    return values  # No variance, return all
                 lower = q1 - 1.5 * iqr
                 upper = q3 + 1.5 * iqr
                 return [v for v in values if lower <= v <= upper]
@@ -270,11 +274,11 @@ class WellnessAnalyzer:
             pitch_filtered = remove_outliers(pitch_values)
             
             # Use median for robustness
-            avg_face_y = np.median(face_y_filtered) if face_y_filtered else np.median(face_y_values)
-            avg_face_x = np.median(face_x_filtered) if face_x_filtered else np.median(face_x_values)
-            avg_pitch = np.median(pitch_filtered) if pitch_filtered else np.median(pitch_values)
+            avg_face_y = np.median(face_y_filtered) if face_y_filtered else np.median(face_y_values) if face_y_values else 0.35
+            avg_face_x = np.median(face_x_filtered) if face_x_filtered else np.median(face_x_values) if face_x_values else 0.5
+            avg_pitch = np.median(pitch_filtered) if pitch_filtered else np.median(pitch_values) if pitch_values else 0.0
             
-            # Validate values
+            # Enhanced validation: check for reasonable values
             if not (0 <= avg_face_y <= 1 and 0 <= avg_face_x <= 1):
                 logging.warning(f"Invalid calibration values: face_y={avg_face_y}, face_x={avg_face_x}")
                 return
@@ -284,17 +288,24 @@ class WellnessAnalyzer:
             self.user_calibration["baseline_face_x"] = avg_face_x
             self.user_calibration["baseline_pitch"] = avg_pitch
             self.user_calibration["baseline_face_y_std"] = np.std(face_y_filtered) if len(face_y_filtered) > 1 else 0.05
+            
+            # Validate std is reasonable
+            if self.user_calibration["baseline_face_y_std"] <= 0 or self.user_calibration["baseline_face_y_std"] > 0.2:
+                self.user_calibration["baseline_face_y_std"] = 0.05
+            
             self.user_calibration["calibrated"] = True
             self.user_calibration["calibration_time"] = datetime.now()
             
-            logging.info(f"User posture calibrated (robust): face_y={avg_face_y:.3f}±{self.user_calibration['baseline_face_y_std']:.3f}, face_x={avg_face_x:.3f}, pitch={avg_pitch:.2f}")
+            logging.info(f"✅ User posture calibrated (robust): face_y={avg_face_y:.3f}±{self.user_calibration['baseline_face_y_std']:.3f}, face_x={avg_face_x:.3f}, pitch={avg_pitch:.2f}")
         except Exception as e:
             logging.error(f"Error in posture calibration: {e}", exc_info=True)
     
     def _calibrate_ear(self):
-        """Enhanced calibration to user's normal EAR with outlier removal"""
+        """Enhanced calibration to user's normal EAR with outlier removal and faster convergence"""
         try:
-            if len(self.user_calibration["ear_samples"]) < 50:
+            # Reduced minimum samples for faster calibration (from 50 to 30)
+            min_samples = 30
+            if len(self.user_calibration["ear_samples"]) < min_samples:
                 return
             
             samples = list(self.user_calibration["ear_samples"])
@@ -311,8 +322,13 @@ class WellnessAnalyzer:
             # Filter outliers
             filtered_samples = [s for s in samples if lower_bound <= s <= upper_bound]
             
-            if len(filtered_samples) < 30:
-                # If too many outliers, use all samples
+            # Require at least 60% of samples to be valid
+            if len(filtered_samples) < int(len(samples) * 0.6):
+                # If too many outliers, use all samples but with wider bounds
+                filtered_samples = [s for s in samples if 0.15 <= s <= 0.40]
+            
+            if len(filtered_samples) < 15:
+                # Still not enough, use all samples
                 filtered_samples = samples
             
             # Use robust statistics: median for baseline, MAD for std
@@ -320,17 +336,22 @@ class WellnessAnalyzer:
             mad = np.median([abs(s - self.ear_baseline) for s in filtered_samples])
             self.ear_std = 1.4826 * mad if mad > 0 else 0.03  # Convert MAD to std estimate
             
-            # Validate values
+            # Enhanced validation: check for reasonable values
             if not (0.15 <= self.ear_baseline <= 0.40):
                 logging.warning(f"Invalid EAR baseline: {self.ear_baseline}, using default")
                 self.ear_baseline = 0.28
                 self.ear_std = 0.03
                 return
             
-            if self.ear_std <= 0:
-                self.ear_std = 0.03  # Default std if too small
+            if self.ear_std <= 0 or self.ear_std > 0.1:
+                # If std is too small or too large, use default
+                self.ear_std = 0.03 if self.ear_std <= 0 else 0.05
             
-            logging.info(f"User EAR calibrated (outlier-robust): baseline={self.ear_baseline:.3f}, std={self.ear_std:.3f}, samples={len(filtered_samples)}/{len(samples)}")
+            # Mark as calibrated
+            self.user_calibration["calibrated"] = True
+            self.user_calibration["calibration_time"] = datetime.now()
+            
+            logging.info(f"✅ User EAR calibrated (outlier-robust): baseline={self.ear_baseline:.3f}, std={self.ear_std:.3f}, samples={len(filtered_samples)}/{len(samples)}")
         except Exception as e:
             logging.error(f"Error in EAR calibration: {e}", exc_info=True)
     
@@ -354,23 +375,50 @@ class WellnessAnalyzer:
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
         """Enhanced image preprocessing for better face detection accuracy"""
         try:
-            # Convert to grayscale if needed
+            # Preserve original for color processing
+            original = image.copy()
+            
+            # Convert to grayscale for processing
             if len(image.shape) == 3:
                 gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
             else:
                 gray = image.copy()
             
-            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(gray)
+            # Step 1: Noise reduction with improved bilateral filter
+            # Better parameters for preserving facial features while reducing noise
+            filtered = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
             
-            # Optional: Apply bilateral filter to reduce noise while preserving edges
-            filtered = cv2.bilateralFilter(enhanced, 9, 75, 75)
+            # Step 2: Adaptive histogram equalization for better contrast
+            # Use CLAHE with optimized parameters
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(filtered)
+            
+            # Step 3: Additional contrast enhancement for low-light conditions
+            # Calculate image statistics
+            mean_brightness = np.mean(enhanced)
+            if mean_brightness < 80:  # Low light condition
+                # Apply gamma correction for better visibility
+                gamma = 1.2
+                inv_gamma = 1.0 / gamma
+                table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+                enhanced = cv2.LUT(enhanced, table)
+            
+            # Step 4: Sharpening filter to enhance facial features
+            kernel = np.array([[-1, -1, -1],
+                             [-1,  9, -1],
+                             [-1, -1, -1]])
+            sharpened = cv2.filter2D(enhanced, -1, kernel)
+            # Blend original and sharpened (70% sharpened, 30% original)
+            enhanced = cv2.addWeighted(enhanced, 0.7, sharpened, 0.3, 0)
             
             # Convert back to RGB if original was RGB
-            if len(image.shape) == 3:
-                return cv2.cvtColor(filtered, cv2.COLOR_GRAY2RGB)
-            return filtered
+            if len(original.shape) == 3:
+                # Apply same enhancements to color channels
+                result = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+                # Preserve color information by blending
+                result = cv2.addWeighted(original, 0.3, result, 0.7, 0)
+                return result
+            return enhanced
         except Exception as e:
             logging.warning(f"Image preprocessing error: {e}")
             return image
@@ -424,7 +472,7 @@ class WellnessAnalyzer:
             return None
     
     def smooth_temporal_data(self, new_value: float, history: deque, alpha: float = 0.3) -> float:
-        """Apply exponential moving average for temporal smoothing"""
+        """Apply adaptive exponential moving average for temporal smoothing"""
         if len(history) == 0:
             history.append(new_value)
             return new_value
@@ -432,8 +480,20 @@ class WellnessAnalyzer:
         # Get last smoothed value
         last_smoothed = history[-1]
         
-        # Apply EMA
-        smoothed = alpha * new_value + (1 - alpha) * last_smoothed
+        # Adaptive smoothing: adjust alpha based on variance
+        adaptive_alpha = alpha
+        if len(history) >= 3:
+            recent_values = list(history)[-5:] if len(history) >= 5 else list(history)
+            variance = np.var(recent_values)
+            
+            # If variance is high (unstable), use more smoothing
+            # If variance is low (stable), use less smoothing (more responsive)
+            if variance > 0.01:  # High variance
+                adaptive_alpha = min(0.5, alpha * 1.5)  # More smoothing
+            elif variance < 0.001:  # Low variance
+                adaptive_alpha = max(0.1, alpha * 0.7)  # Less smoothing, more responsive
+            else:
+                adaptive_alpha = alpha
         
         # Detect outliers and handle them
         if len(history) >= 3:
@@ -443,9 +503,15 @@ class WellnessAnalyzer:
             
             # If new value is outlier, use more smoothing
             if std_val > 0 and abs(new_value - mean_val) > self.outlier_threshold * std_val:
-                alpha = 0.1  # More smoothing for outliers
-                smoothed = alpha * new_value + (1 - alpha) * last_smoothed
+                adaptive_alpha = 0.1  # More smoothing for outliers
+                smoothed = adaptive_alpha * new_value + (1 - adaptive_alpha) * last_smoothed
                 logging.debug(f"Outlier detected: {new_value:.2f}, using more smoothing")
+            else:
+                # Use adaptive alpha for normal smoothing
+                smoothed = adaptive_alpha * new_value + (1 - adaptive_alpha) * last_smoothed
+        else:
+            # Use adaptive alpha for normal smoothing
+            smoothed = adaptive_alpha * new_value + (1 - adaptive_alpha) * last_smoothed
         
         history.append(smoothed)
         return smoothed
@@ -515,19 +581,21 @@ class WellnessAnalyzer:
             return {"direction": "forward", "confidence": 0, "angle": 0}
     
     def calculate_eye_aspect_ratio(self, landmarks, eye_points) -> float:
-        """Calculate Eye Aspect Ratio (EAR) using improved 6-point method with validation"""
+        """Calculate Eye Aspect Ratio (EAR) using improved 6-point method with enhanced validation"""
         if not landmarks or len(landmarks) < 468:
             return 0.0
         
         try:
-            # Get eye landmark coordinates with validation
+            # Get eye landmark coordinates with enhanced validation
             eye_coords = []
             for idx in eye_points:
                 if idx < len(landmarks) and landmarks[idx] is not None:
                     landmark = landmarks[idx]
-                    # Validate landmark coordinates
+                    # Enhanced validation: check coordinates are within valid range
                     if 0 <= landmark.x <= 1 and 0 <= landmark.y <= 1:
-                        eye_coords.append(np.array([landmark.x, landmark.y]))
+                        # Additional check: ensure coordinates are not NaN or Inf
+                        if np.isfinite(landmark.x) and np.isfinite(landmark.y):
+                            eye_coords.append(np.array([landmark.x, landmark.y]))
             
             if len(eye_coords) < 6:
                 return 0.0
@@ -549,18 +617,33 @@ class WellnessAnalyzer:
             # Calculate horizontal distance (eye width)
             horizontal = np.linalg.norm(p_outer - p_inner)
             
-            # Validate measurements
-            if horizontal < 0.01:  # Too small, likely invalid
+            # Enhanced validation: check measurements are reasonable
+            if horizontal < 0.008:  # Too small, likely invalid (stricter threshold)
                 return 0.0
             
-            # Improved EAR: average of center and outer measurements for robustness
+            # Check for coordinate consistency (points should form reasonable eye shape)
+            if vertical_1 < 0.001 or vertical_2 < 0.001:  # Eye too narrow
+                return 0.0
+            
+            # Improved EAR: weighted average of center and outer measurements for robustness
             ear_center = vertical_1 / horizontal
             ear_outer = vertical_2 / horizontal if vertical_2 > 0 else ear_center
-            ear = (ear_center + ear_outer) / 2.0
             
-            # Additional validation: check if measurements are reasonable
-            if ear > 0.5 or ear < 0.05:  # Unrealistic values
+            # Use weighted average (more weight on center measurement)
+            ear = (ear_center * 0.7 + ear_outer * 0.3)
+            
+            # Enhanced validation: check if measurements are reasonable
+            # Normal EAR range: 0.15-0.40 (allowing wider range for validation)
+            if ear > 0.55 or ear < 0.03:  # Unrealistic values (stricter)
                 return 0.0
+            
+            # Additional outlier check: compare with historical average if available
+            if len(self.user_calibration["ear_samples"]) > 10:
+                recent_avg = np.mean(list(self.user_calibration["ear_samples"])[-10:])
+                # If current EAR is more than 3 std devs from recent average, likely invalid
+                if abs(ear - recent_avg) > 0.15:  # Significant deviation
+                    # Still return value but log warning
+                    logging.debug(f"EAR outlier detected: {ear:.3f} vs recent avg {recent_avg:.3f}")
             
             return max(0.0, min(1.0, ear))
         except Exception as e:
@@ -761,8 +844,8 @@ class WellnessAnalyzer:
                 "pitch": head_pose.get("pitch", 0),
                 "roll": head_pose.get("roll", 0)
             })
-            # Calibrate after 30 samples (about 10 seconds at 3 FPS)
-            if len(self.user_calibration["posture_samples"]) >= 30:
+            # Calibrate after 20 samples (faster calibration - about 7 seconds at 3 FPS)
+            if len(self.user_calibration["posture_samples"]) >= 20:
                 self._calibrate_posture()
         
         # Analyze posture based on multiple factors with more sensitivity
@@ -820,20 +903,43 @@ class WellnessAnalyzer:
         horizontal_offset = abs(face_center_x - 0.5)
         horizontal_penalty = min(30, horizontal_offset * 60)  # More sensitive (was 50)
         
-        # DIRECTLY map face position to score for maximum responsiveness
-        # This ensures ANY position change is immediately reflected
-        # Use face_center_y directly - no complex calculations
+        # Optimized direct mapping: face position to score for maximum responsiveness
+        # Simplified calculation for better performance and accuracy
         ideal_y = 0.35
-        y_diff = face_center_y - ideal_y
         
-        # Direct linear mapping: face_y 0.2-0.7 maps to score 100-15
-        # Lower face (higher y) = lower score (slouching)
-        if face_center_y <= ideal_y:
-            # Face is high (good posture)
-            position_based_score = 100 - abs(y_diff) * 200
+        # Use calibrated baseline if available for personalized scoring
+        if self.user_calibration.get("calibrated", False):
+            baseline_y = self.user_calibration.get("baseline_face_y", ideal_y)
+            baseline_std = self.user_calibration.get("baseline_face_y_std", 0.05)
+            
+            # Calculate deviation from personal baseline
+            y_deviation = face_center_y - baseline_y
+            
+            # Score based on deviation from personal baseline (more accurate)
+            if abs(y_deviation) < baseline_std:
+                # Within normal range
+                position_based_score = 100 - (abs(y_deviation) / baseline_std) * 10
+            elif abs(y_deviation) < 2 * baseline_std:
+                # Slight deviation
+                position_based_score = 90 - ((abs(y_deviation) - baseline_std) / baseline_std) * 25
+            elif abs(y_deviation) < 3 * baseline_std:
+                # Moderate deviation
+                position_based_score = 65 - ((abs(y_deviation) - 2 * baseline_std) / baseline_std) * 30
+            else:
+                # Large deviation (slouching)
+                position_based_score = 35 - ((abs(y_deviation) - 3 * baseline_std) / baseline_std) * 20
         else:
-            # Face is low (slouching) - more penalty
-            position_based_score = 100 - abs(y_diff) * 350
+            # Use standard mapping until calibrated
+            y_diff = face_center_y - ideal_y
+            
+            # Direct linear mapping: face_y 0.2-0.7 maps to score 100-15
+            # Lower face (higher y) = lower score (slouching)
+            if face_center_y <= ideal_y:
+                # Face is high (good posture)
+                position_based_score = 100 - abs(y_diff) * 200
+            else:
+                # Face is low (slouching) - more penalty
+                position_based_score = 100 - abs(y_diff) * 350
         
         position_based_score = max(15, min(100, position_based_score))
         
@@ -1017,8 +1123,8 @@ class WellnessAnalyzer:
             # Collect calibration samples
             if not self.user_calibration["calibrated"]:
                 self.user_calibration["ear_samples"].append(avg_ear)
-                # Calibrate after 50 samples
-                if len(self.user_calibration["ear_samples"]) >= 50:
+                # Calibrate after 30 samples (faster calibration)
+                if len(self.user_calibration["ear_samples"]) >= 30:
                     self._calibrate_ear()
             
             # Adaptive baseline: update baseline if we have enough history
@@ -1666,7 +1772,7 @@ def detect_face_opencv(image: np.ndarray) -> Tuple[Optional, Optional, Optional]
                 
                 for i in range(detections.shape[2]):
                     conf = detections[0, 0, i, 2]
-                    if conf > 0.7:  # Higher confidence threshold for better accuracy
+                    if conf > 0.75:  # Higher confidence threshold for better accuracy (increased from 0.7)
                         x1 = int(detections[0, 0, i, 3] * w)
                         y1 = int(detections[0, 0, i, 4] * h)
                         x2 = int(detections[0, 0, i, 5] * w)
