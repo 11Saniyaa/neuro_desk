@@ -43,6 +43,7 @@ const fetchWithTimeout = async (url, options = {}, timeout = DEFAULT_TIMEOUT) =>
 
 /**
  * Retry fetch with exponential backoff
+ * @param {AbortController} externalController - Optional external AbortController
  */
 export const fetchWithRetry = async (
   url,
@@ -52,14 +53,24 @@ export const fetchWithRetry = async (
     timeout = DEFAULT_TIMEOUT,
     retryDelay = DEFAULT_RETRY_DELAY,
     retryableStatuses = [408, 429, 500, 502, 503, 504],
-    onRetry = null
+    onRetry = null,
+    externalController = null
   } = {}
 ) => {
   let lastError;
   
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // Check if external controller aborted
+    if (externalController && externalController.signal.aborted) {
+      throw new Error('Request was cancelled')
+    }
+    
     try {
-      const response = await fetchWithTimeout(url, options, timeout);
+      // Merge external controller signal if provided
+      const fetchOptions = externalController 
+        ? { ...options, signal: externalController.signal }
+        : options
+      const response = await fetchWithTimeout(url, fetchOptions, timeout);
       
       // If successful or non-retryable error, return immediately
       if (response.ok || !retryableStatuses.includes(response.status)) {
@@ -101,8 +112,11 @@ export const fetchWithRetry = async (
 
 /**
  * Analyze frame with improved error handling
+ * @param {string} imageData - Base64 encoded image data
+ * @param {Function} onRetry - Optional callback for retry events
+ * @param {AbortController} externalController - Optional external AbortController for cleanup
  */
-export const analyzeFrame = async (imageData, onRetry = null) => {
+export const analyzeFrame = async (imageData, onRetry = null, externalController = null) => {
   // Validate imageData before making request
   if (!imageData || typeof imageData !== 'string') {
     throw new Error('Invalid image data: imageData is required and must be a string')
@@ -115,6 +129,10 @@ export const analyzeFrame = async (imageData, onRetry = null) => {
   if (imageData.length < 100) {
     throw new Error('Invalid image data: image data is too short or empty')
   }
+  
+  // Create internal controller if none provided
+  const internalController = new AbortController()
+  const controller = externalController || internalController
   
   try {
     const response = await fetchWithRetry(
@@ -130,7 +148,8 @@ export const analyzeFrame = async (imageData, onRetry = null) => {
         maxRetries: 2, // Fewer retries for real-time analysis
         timeout: 8000, // 8 seconds timeout
         retryDelay: 500, // Faster retry for real-time
-        onRetry
+        onRetry,
+        externalController: controller
       }
     );
 
