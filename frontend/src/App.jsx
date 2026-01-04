@@ -87,7 +87,7 @@ function App() {
 
     window.addEventListener('keydown', handleKeyPress)
     return () => window.removeEventListener('keydown', handleKeyPress)
-  }, [isConnected, showSettings, data, stopCamera, exportData])
+  }, [isConnected, showSettings, data, stopCamera, exportData, startCamera])
 
   // Export data function
   const exportData = useCallback(() => {
@@ -428,7 +428,7 @@ function App() {
     connectWebSocketRef.current = connectWebSocket
   }, [connectWebSocket])
 
-  const startCamera = async () => {
+  const startCamera = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { 
@@ -443,13 +443,19 @@ function App() {
         videoRef.current.srcObject = stream
         await videoRef.current.play()
         
-        // Wait for video to be ready before connecting WebSocket
-        await new Promise((resolve) => {
+        // Wait for video to be ready before connecting WebSocket (with timeout)
+        const maxWaitTime = 5000 // 5 seconds max wait
+        const checkInterval = 100 // Check every 100ms
+        const startTime = Date.now()
+        
+        await new Promise((resolve, reject) => {
           const checkReady = () => {
             if (videoRef.current && videoRef.current.readyState >= 2) {
               resolve()
+            } else if (Date.now() - startTime > maxWaitTime) {
+              reject(new Error('Video failed to become ready within timeout'))
             } else {
-              setTimeout(checkReady, 100)
+              setTimeout(checkReady, checkInterval)
             }
           }
           checkReady()
@@ -467,12 +473,20 @@ function App() {
         }
       }, 500) // 500ms delay
     } catch (err) {
-      setError('Camera access denied. Please allow camera permissions.')
+      let errorMessage = 'Camera access denied. Please allow camera permissions.'
+      if (err.message && err.message.includes('timeout')) {
+        errorMessage = 'Video failed to initialize. Please try again.'
+      } else if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        errorMessage = 'Camera access denied. Please allow camera permissions in your browser settings.'
+      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+        errorMessage = 'No camera found. Please connect a camera and try again.'
+      }
+      setError(errorMessage)
       console.error('Camera error:', err)
       setIsConnected(false)
       setIsAnalyzing(false)
     }
-  }
+  }, [])
 
   const stopCamera = useCallback(() => {
     if (streamRef.current) {
