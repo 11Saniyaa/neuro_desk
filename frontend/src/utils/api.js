@@ -80,8 +80,9 @@ export const fetchWithRetry = async (
     } catch (error) {
       lastError = error;
       
-      // Don't retry on abort/timeout if it's the last attempt
-      if (attempt < maxRetries && error.name !== 'AbortError') {
+      // Retry on network errors and timeouts (AbortError) if not last attempt
+      // Timeouts are retryable as they might be transient network issues
+      if (attempt < maxRetries) {
         const delay = getRetryDelay(attempt, retryDelay);
         if (onRetry) {
           onRetry(attempt + 1, maxRetries, delay);
@@ -91,9 +92,7 @@ export const fetchWithRetry = async (
       }
       
       // Last attempt failed
-      if (attempt === maxRetries) {
-        throw error;
-      }
+      throw error;
     }
   }
   
@@ -146,15 +145,14 @@ export const analyzeFrame = async (imageData, onRetry = null) => {
     return result;
   } catch (error) {
     // Provide user-friendly error messages
-    if (error.message.includes('timeout')) {
+    if (error.name === 'AbortError' || error.message.includes('timeout')) {
       throw new Error('Request timeout - the server is taking too long to respond. Please check your connection.');
     } else if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
       throw new Error('Cannot connect to server. Make sure the backend is running on http://localhost:8000');
-    } else if (error.message.includes('AbortError')) {
-      throw new Error('Request was cancelled or timed out');
     } else {
       throw error;
     }
   }
 };
+
 
