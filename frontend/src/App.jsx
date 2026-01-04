@@ -9,9 +9,14 @@ function App() {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const [darkMode, setDarkMode] = useState(() => {
-    // Load from localStorage or default to false
-    const saved = localStorage.getItem('darkMode')
-    return saved ? JSON.parse(saved) : false
+    // Load from localStorage or default to false (with error handling for private browsing)
+    try {
+      const saved = localStorage.getItem('darkMode')
+      return saved ? JSON.parse(saved) : false
+    } catch (error) {
+      console.warn('Failed to read from localStorage:', error)
+      return false // Default to light mode if localStorage is unavailable
+    }
   })
   const [showSettings, setShowSettings] = useState(false)
   const [sessionStartTime, setSessionStartTime] = useState(null)
@@ -25,10 +30,26 @@ function App() {
   const reconnectTimeoutRef = useRef(null)
   const isConnectedRef = useRef(false) // Use ref to avoid stale closures
   const connectWebSocketRef = useRef(null) // Ref to store connectWebSocket function
+  const abortControllersRef = useRef([]) // Track active AbortControllers for cleanup
 
   useEffect(() => {
     isConnectedRef.current = isConnected
   }, [isConnected])
+
+  // Cleanup AbortControllers on unmount
+  useEffect(() => {
+    return () => {
+      // Abort all active requests when component unmounts
+      abortControllersRef.current.forEach(controller => {
+        try {
+          controller.abort()
+        } catch (error) {
+          // Ignore errors during cleanup
+        }
+      })
+      abortControllersRef.current = []
+    }
+  }, [])
 
   // Update dark mode class on body
   useEffect(() => {
@@ -37,7 +58,13 @@ function App() {
     } else {
       document.body.classList.remove('dark-mode')
     }
-    localStorage.setItem('darkMode', JSON.stringify(darkMode))
+    // Save to localStorage with error handling (fails in private browsing)
+    try {
+      localStorage.setItem('darkMode', JSON.stringify(darkMode))
+    } catch (error) {
+      console.warn('Failed to save to localStorage:', error)
+      // Continue without saving - preference will reset on reload
+    }
   }, [darkMode])
 
   // Session timer
@@ -224,13 +251,21 @@ function App() {
         
         isSending = true
         setIsLoading(true)
+        
+        // Create AbortController for this request
+        const controller = new AbortController()
+        abortControllersRef.current.push(controller)
+        
         try {
           console.log('📤 Sending frame to /analyze...')
           
           // Use improved API utility with timeout and retry
           const result = await analyzeFrame(imageData, (attempt, maxRetries, delay) => {
             console.log(`🔄 Retrying request (${attempt}/${maxRetries}) after ${delay}ms...`)
-          })
+          }, controller)
+          
+          // Remove controller from tracking after successful request
+          abortControllersRef.current = abortControllersRef.current.filter(c => c !== controller)
           
           console.log('✅ Received analysis data via HTTP:', {
             timestamp: result.timestamp || 'N/A',
@@ -255,6 +290,9 @@ function App() {
           setError(null)
         } catch (fetchErr) {
           console.error('❌ Error sending frame via HTTP:', fetchErr)
+          
+          // Remove controller from tracking
+          abortControllersRef.current = abortControllersRef.current.filter(c => c !== controller)
           
           setIsLoading(false)
           // Set user-friendly error message
