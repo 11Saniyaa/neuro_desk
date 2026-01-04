@@ -201,6 +201,27 @@ function App() {
         // Performance: Use lower quality for faster transmission
         const imageData = canvas.toDataURL('image/jpeg', 0.6)
         
+        // Validate imageData before sending
+        if (!imageData || typeof imageData !== 'string') {
+          console.warn('⚠️ Invalid imageData: not a string')
+          animationFrameRef.current = requestAnimationFrame(sendFrame)
+          return
+        }
+        
+        // Validate that it's a valid data URL with actual content
+        if (!imageData.startsWith('data:image/')) {
+          console.warn('⚠️ Invalid imageData: not a valid image data URL')
+          animationFrameRef.current = requestAnimationFrame(sendFrame)
+          return
+        }
+        
+        // Check minimum length (data:image/jpeg;base64, is ~23 chars, need actual data)
+        if (imageData.length < 100) {
+          console.warn('⚠️ Invalid imageData: too short, likely empty')
+          animationFrameRef.current = requestAnimationFrame(sendFrame)
+          return
+        }
+        
         isSending = true
         setIsLoading(true)
         try {

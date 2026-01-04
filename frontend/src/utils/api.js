@@ -103,6 +103,19 @@ export const fetchWithRetry = async (
  * Analyze frame with improved error handling
  */
 export const analyzeFrame = async (imageData, onRetry = null) => {
+  // Validate imageData before making request
+  if (!imageData || typeof imageData !== 'string') {
+    throw new Error('Invalid image data: imageData is required and must be a string')
+  }
+  
+  if (!imageData.startsWith('data:image/')) {
+    throw new Error('Invalid image data: must be a valid image data URL')
+  }
+  
+  if (imageData.length < 100) {
+    throw new Error('Invalid image data: image data is too short or empty')
+  }
+  
   try {
     const response = await fetchWithRetry(
       '/analyze',
