@@ -78,8 +78,13 @@ function App() {
       setSessionDuration(0)
       setSessionStartTime(null)
     }
+    
+    // Cleanup: Always clear interval on unmount or dependency change
     return () => {
-      if (interval) clearInterval(interval)
+      if (interval) {
+        clearInterval(interval)
+        interval = null
+      }
     }
   }, [isConnected, sessionStartTime])
 
