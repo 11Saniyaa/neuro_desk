@@ -260,8 +260,16 @@ class WellnessAnalyzer:
         self.engagement_history = deque(maxlen=10)  # Last 10 engagement scores
         self.stress_history = deque(maxlen=10)  # Last 10 stress scores
         
+        # Multi-frame averaging for better accuracy
+        self.ear_frame_buffer = deque(maxlen=5)  # Last 5 EAR values for averaging
+        self.landmark_quality_history = deque(maxlen=10)  # Track landmark quality
+        self.landmark_history = deque(maxlen=3)  # Track last 3 landmark sets for consistency
+        
         # Outlier detection thresholds
         self.outlier_threshold = 2.5  # Standard deviations for outlier detection
+        
+        # Frame quality thresholds
+        self.min_frame_quality = 0.6  # Minimum quality to use frame
     
     def _calibrate_posture(self):
         """Enhanced calibration to user's normal posture with outlier removal and faster convergence"""
@@ -462,38 +470,71 @@ class WellnessAnalyzer:
             self.lighting_adaptation = 1.0  # Normal
     
     def validate_image_quality(self, image: np.ndarray) -> Dict:
-        """Validate image quality before processing"""
+        """Validate image quality before processing with enhanced metrics"""
         try:
             gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if len(image.shape) == 3 else image
             
-            # Brightness check
-            brightness = np.mean(gray) / 255.0
-            if brightness < 0.15:
-                return {"valid": False, "reason": "too_dark", "brightness": brightness}
-            if brightness > 0.95:
-                return {"valid": False, "reason": "too_bright", "brightness": brightness}
+            # Calculate image statistics
+            mean_brightness = np.mean(gray)
+            std_brightness = np.std(gray)
             
             # Blur detection using Laplacian variance
             laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-            if laplacian_var < 50:
-                return {"valid": False, "reason": "too_blurry", "sharpness": laplacian_var}
             
-            # Contrast check
-            contrast = np.std(gray) / 255.0
-            if contrast < 0.1:
-                return {"valid": False, "reason": "low_contrast", "contrast": contrast}
+            # Additional quality metrics - edge density
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / (gray.shape[0] * gray.shape[1])
+            
+            # Normalize metrics
+            brightness = mean_brightness / 255.0
+            contrast = std_brightness / 255.0
+            
+            # Quality score (0-1) with enhanced weighting
+            brightness_score = min(1.0, mean_brightness / 128.0)
+            contrast_score = min(1.0, std_brightness / 64.0)
+            sharpness_score = min(1.0, laplacian_var / 100.0)
+            edge_score = min(1.0, edge_density * 10)
+            
+            quality_score = (
+                brightness_score * 0.20 + 
+                contrast_score * 0.25 + 
+                sharpness_score * 0.30 + 
+                edge_score * 0.25
+            )
+            
+            # Enhanced validation with quality threshold
+            is_valid = (
+                mean_brightness > 30 and
+                mean_brightness < 220 and
+                std_brightness > 10 and
+                laplacian_var > 50 and
+                quality_score >= self.min_frame_quality
+            )
+            
+            reasons = []
+            if mean_brightness <= 30:
+                reasons.append("too_dark")
+            if mean_brightness >= 220:
+                reasons.append("too_bright")
+            if std_brightness <= 10:
+                reasons.append("low_contrast")
+            if laplacian_var <= 50:
+                reasons.append("too_blurry")
+            if quality_score < self.min_frame_quality:
+                reasons.append("low_quality")
             
             return {
-                "valid": True,
-                "brightness": brightness,
+                "valid": is_valid,
+                "quality_score": quality_score,
+                "brightness": mean_brightness,
+                "contrast": std_brightness,
                 "sharpness": laplacian_var,
-                "contrast": contrast,
-                "quality_score": min(100, (brightness * 30 + min(1, laplacian_var/200) * 40 + contrast * 30))
+                "edge_density": edge_density,
+                "reason": ", ".join(reasons) if reasons else None
             }
         except Exception as e:
             logging.warning(f"Error validating image quality: {e}")
-            # Return None instead of static default - let caller decide
-            return None
+            return {"valid": True, "quality_score": 0.7, "reason": None}
     
     def smooth_temporal_data(self, new_value: float, history: deque, alpha: float = 0.3) -> float:
         """Apply adaptive exponential moving average for temporal smoothing"""
@@ -604,9 +645,61 @@ class WellnessAnalyzer:
             logging.warning(f"Error calculating gaze direction: {e}")
             return {"direction": "forward", "confidence": 0, "angle": 0}
     
+    def validate_landmark_consistency(self, landmarks) -> float:
+        """Validate landmark consistency across frames"""
+        if not landmarks or len(landmarks) < 468:
+            return 0.0
+        
+        # If we have history, check consistency
+        if len(self.landmark_history) >= 2:
+            # Get key landmark points (nose, eyes, mouth)
+            key_indices = [4, 33, 133, 159, 145, 362, 386, 380, 374, 10, 152]
+            current_points = []
+            for idx in key_indices:
+                if idx < len(landmarks) and landmarks[idx] is not None:
+                    current_points.append((landmarks[idx].x, landmarks[idx].y))
+            
+            if len(current_points) < 8:  # Need at least 8 points
+                return 0.5  # Medium confidence
+            
+            # Compare with previous frames
+            consistency_scores = []
+            for prev_landmarks in self.landmark_history:
+                if prev_landmarks and len(prev_landmarks) >= 468:
+                    prev_points = []
+                    for idx in key_indices:
+                        if idx < len(prev_landmarks) and prev_landmarks[idx] is not None:
+                            prev_points.append((prev_landmarks[idx].x, prev_landmarks[idx].y))
+                    
+                    if len(prev_points) == len(current_points):
+                        # Calculate average displacement
+                        displacements = []
+                        for (cx, cy), (px, py) in zip(current_points, prev_points):
+                            dist = np.sqrt((cx - px)**2 + (cy - py)**2)
+                            displacements.append(dist)
+                        
+                        avg_displacement = np.mean(displacements)
+                        # Low displacement = high consistency
+                        consistency = max(0.0, 1.0 - avg_displacement * 10)  # Scale factor
+                        consistency_scores.append(consistency)
+            
+            if consistency_scores:
+                avg_consistency = np.mean(consistency_scores)
+                return avg_consistency
+        
+        # Store current landmarks for next comparison
+        self.landmark_history.append(landmarks)
+        return 0.8  # Default confidence for first frames
+    
     def calculate_eye_aspect_ratio(self, landmarks, eye_points) -> float:
         """Calculate Eye Aspect Ratio (EAR) using improved 6-point method with enhanced validation"""
         if not landmarks or len(landmarks) < 468:
+            return 0.0
+        
+        # Validate landmark consistency
+        consistency = self.validate_landmark_consistency(landmarks)
+        if consistency < 0.3:  # Very low consistency - likely bad detection
+            logging.debug(f"Low landmark consistency: {consistency:.2f}, skipping EAR calculation")
             return 0.0
         
         try:
@@ -664,10 +757,38 @@ class WellnessAnalyzer:
             # Additional outlier check: compare with historical average if available
             if len(self.user_calibration["ear_samples"]) > 10:
                 recent_avg = np.mean(list(self.user_calibration["ear_samples"])[-10:])
+                recent_std = np.std(list(self.user_calibration["ear_samples"])[-10:])
                 # If current EAR is more than 3 std devs from recent average, likely invalid
-                if abs(ear - recent_avg) > 0.15:  # Significant deviation
-                    # Still return value but log warning
-                    logging.debug(f"EAR outlier detected: {ear:.3f} vs recent avg {recent_avg:.3f}")
+                if recent_std > 0 and abs(ear - recent_avg) > 3 * recent_std:
+                    # Significant deviation - use median of recent values instead
+                    recent_median = np.median(list(self.user_calibration["ear_samples"])[-10:])
+                    if abs(ear - recent_median) > 0.15:
+                        logging.debug(f"EAR outlier detected: {ear:.3f} vs recent avg {recent_avg:.3f}, using median {recent_median:.3f}")
+                        # Return median if it's more reasonable
+                        if 0.15 <= recent_median <= 0.40:
+                            ear = recent_median
+            
+            # Multi-frame averaging for stability (use last 3-5 frames)
+            self.ear_frame_buffer.append(ear)
+            if len(self.ear_frame_buffer) >= 3:
+                # Use median of recent frames for more robust averaging
+                recent_ears = list(self.ear_frame_buffer)
+                # Remove outliers using IQR
+                if len(recent_ears) >= 3:
+                    q1 = np.percentile(recent_ears, 25)
+                    q3 = np.percentile(recent_ears, 75)
+                    iqr = q3 - q1
+                    if iqr > 0:
+                        filtered = [e for e in recent_ears if q1 - 1.5*iqr <= e <= q3 + 1.5*iqr]
+                        if len(filtered) >= 2:
+                            # Use median of filtered values for robustness
+                            ear = np.median(filtered)
+                        else:
+                            # Fallback to median of all
+                            ear = np.median(recent_ears)
+                    else:
+                        # No variance, use median
+                        ear = np.median(recent_ears)
             
             return max(0.0, min(1.0, ear))
         except Exception as e:
@@ -1144,25 +1265,37 @@ class WellnessAnalyzer:
             session_history = deque(maxlen=30)
         
         if avg_ear > 0:
-            # Collect calibration samples
+            # Collect calibration samples (only if EAR is valid)
             if not self.user_calibration["calibrated"]:
-                self.user_calibration["ear_samples"].append(avg_ear)
-                # Calibrate after 30 samples (faster calibration)
-                if len(self.user_calibration["ear_samples"]) >= 30:
-                    self._calibrate_ear()
+                # Only add if EAR is within reasonable range
+                if 0.15 <= avg_ear <= 0.40:
+                    self.user_calibration["ear_samples"].append(avg_ear)
+                    # Calibrate after 30 samples (faster calibration)
+                    if len(self.user_calibration["ear_samples"]) >= 30:
+                        self._calibrate_ear()
             
             # Adaptive baseline: update baseline if we have enough history
             if len(session_history) > 10:
                 recent_ears = list(session_history)[-10:]
+                # Filter out outliers before updating baseline
+                if len(recent_ears) >= 5:
+                    q1 = np.percentile(recent_ears, 25)
+                    q3 = np.percentile(recent_ears, 75)
+                    iqr = q3 - q1
+                    if iqr > 0:
+                        filtered_ears = [e for e in recent_ears if q1 - 1.5*iqr <= e <= q3 + 1.5*iqr]
+                        if len(filtered_ears) >= 3:
+                            recent_ears = filtered_ears
+                
                 # Use calibrated baseline if available, otherwise adapt
                 if self.user_calibration["calibrated"]:
                     # Slowly adapt to changes (learning rate)
                     learning_rate = 0.1
-                    new_baseline = np.mean(recent_ears)
+                    new_baseline = np.median(recent_ears)  # Use median for robustness
                     self.ear_baseline = (1 - learning_rate) * self.ear_baseline + learning_rate * new_baseline
                     self.ear_std = np.std(recent_ears)
                 else:
-                    self.ear_baseline = np.mean(recent_ears)
+                    self.ear_baseline = np.median(recent_ears)  # Use median
                     self.ear_std = np.std(recent_ears)
             
             # Weighted smoothing: recent frames have more weight
@@ -1192,21 +1325,31 @@ class WellnessAnalyzer:
             blink_duration = 0
             
             for i, ear in enumerate(recent_ears[1:], 1):
-                # Detect blink start (EAR drops significantly)
-                if ear < adaptive_blink_threshold and prev_ear >= adaptive_blink_threshold:
-                    # Blink started
-                    in_blink = True
-                    blink_duration = 1
-                elif ear < adaptive_blink_threshold and in_blink:
-                    # Still in blink
+                # Enhanced blink detection with state machine
+                # State 1: Eye open -> detect drop below threshold
+                if not in_blink and ear < adaptive_blink_threshold and prev_ear >= adaptive_blink_threshold:
+                    # Blink started - validate it's a significant drop
+                    drop_magnitude = prev_ear - ear
+                    if drop_magnitude > 0.05:  # Significant drop (at least 5% of baseline)
+                        in_blink = True
+                        blink_duration = 1
+                # State 2: In blink -> track duration
+                elif in_blink and ear < adaptive_blink_threshold:
                     blink_duration += 1
-                elif ear >= adaptive_blink_threshold and prev_ear < adaptive_blink_threshold and in_blink:
-                    # Blink completed (EAR returns above threshold)
-                    # Validate blink: should be 1-5 frames (not too short, not too long)
-                    if 1 <= blink_duration <= 5:
+                # State 3: Blink ending -> detect return above threshold
+                elif in_blink and ear >= adaptive_blink_threshold and prev_ear < adaptive_blink_threshold:
+                    # Blink completed - validate duration and magnitude
+                    # Normal blink: 1-5 frames (100-500ms at 5 FPS)
+                    if 1 <= blink_duration <= 5 and ear >= adaptive_blink_threshold * 0.8:
                         blink_count += 1
                     in_blink = False
                     blink_duration = 0
+                # State 4: False positive check - if blink too long, cancel it
+                elif in_blink and blink_duration > 8:
+                    # Too long to be a blink, likely eyes closed or error
+                    in_blink = False
+                    blink_duration = 0
+                
                 prev_ear = ear
             
             # Calculate blink rate (blinks per minute)
@@ -2502,7 +2645,15 @@ async def analyze_frame(request: AnalyzeRequest):
             # Detailed face detection logging
             has_landmarks = landmarks is not None and len(landmarks) > 0 if landmarks else False
             detection_method = 'MediaPipe' if MEDIAPIPE_AVAILABLE else 'OpenCV'
-            logging.info(f"🔍 Face detection: detected={face_detected}, has_landmarks={has_landmarks}, method={detection_method}")
+            
+            # Validate landmark consistency if available
+            landmark_consistency = 0.8  # Default
+            if landmarks and has_landmarks:
+                landmark_consistency = analyzer.validate_landmark_consistency(landmarks)
+                if landmark_consistency < 0.4:
+                    logging.warning(f"⚠️ Low landmark consistency: {landmark_consistency:.2f} - may affect accuracy")
+            
+            logging.info(f"🔍 Face detection: detected={face_detected}, has_landmarks={has_landmarks}, method={detection_method}, consistency={landmark_consistency:.2f}")
             if face_detected:
                 logging.info(f"   📊 Using {detection_method} for analysis - {'Full 468 landmarks' if has_landmarks else 'Estimated landmarks'}")
             if face_detected and face_results:
