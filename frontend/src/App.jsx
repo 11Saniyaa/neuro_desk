@@ -88,12 +88,12 @@ function App() {
     }
   }, [isConnected, sessionStartTime])
 
-  // Format session duration
-  const formatDuration = (seconds) => {
+  // Format session duration - memoized for performance
+  const formatDuration = React.useCallback((seconds) => {
     const mins = Math.floor(seconds / 60)
     const secs = seconds % 60
     return `${mins}:${secs.toString().padStart(2, '0')}`
-  }
+  }, [])
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -573,17 +573,30 @@ function App() {
     }
   }, [stopSendingFrames])
 
-  const getScoreColor = (score) => {
+  // Memoize expensive calculations
+  const getScoreColor = React.useCallback((score) => {
     if (score >= 80) return '#60a5fa' // Bright blue for excellent
     if (score >= 60) return '#3b82f6' // Medium blue for good
     return '#ef4444' // Red for poor
-  }
+  }, [])
 
-  const getStatusIcon = (status) => {
+  const getStatusIcon = React.useCallback((status) => {
     if (status === 'high' || status === 'low' && status !== 'low') return '✅'
     if (status === 'medium') return '⚠️'
     return '❌'
-  }
+  }, [])
+
+  // Memoize productivity score display value
+  const productivityScore = React.useMemo(() => {
+    if (!data?.productivity?.productivity_score) return null
+    return data.productivity.productivity_score.toFixed(1)
+  }, [data?.productivity?.productivity_score])
+
+  // Memoize productivity score color
+  const productivityScoreColor = React.useMemo(() => {
+    if (!data?.productivity?.productivity_score) return '#9ca3af'
+    return getScoreColor(data.productivity.productivity_score)
+  }, [data?.productivity?.productivity_score, getScoreColor])
 
   return (
     <div className="app">
@@ -706,9 +719,9 @@ function App() {
               <h2>📊 Productivity Score</h2>
               <div 
                 className="score-display"
-                style={{ color: getScoreColor(data.productivity?.productivity_score || 0) }}
+                style={{ color: productivityScoreColor }}
               >
-                {data.productivity?.productivity_score ? data.productivity.productivity_score.toFixed(1) : 'N/A'}
+                {productivityScore || 'N/A'}
               </div>
             </div>
 
