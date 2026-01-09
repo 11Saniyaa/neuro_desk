@@ -588,19 +588,24 @@ function App() {
   return (
     <div className="app">
       <header className="header">
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
-          <div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', flexWrap: 'wrap', gap: '20px' }}>
+          <div style={{ flex: '1', minWidth: '300px' }}>
             <h1>🤖 AI Human-Computer Interaction Coach</h1>
             <p>Real-time wellness monitoring for your workspace</p>
           </div>
-          <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
             {isConnected && sessionDuration > 0 && (
               <div style={{ 
-                background: 'rgba(59, 130, 246, 0.2)', 
-                padding: '8px 16px', 
-                borderRadius: '8px',
-                fontSize: '0.9rem',
-                color: '#60a5fa'
+                background: 'rgba(59, 130, 246, 0.25)', 
+                backdropFilter: 'blur(10px)',
+                padding: '10px 20px', 
+                borderRadius: '12px',
+                fontSize: '1rem',
+                color: '#60a5fa',
+                fontWeight: '600',
+                border: '1px solid rgba(59, 130, 246, 0.3)',
+                boxShadow: '0 4px 15px rgba(59, 130, 246, 0.2)',
+                letterSpacing: '0.5px'
               }}>
                 ⏱️ {formatDuration(sessionDuration)}
               </div>
@@ -609,6 +614,7 @@ function App() {
               onClick={() => setDarkMode(!darkMode)}
               className="theme-toggle"
               title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+              aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
             >
               {darkMode ? '☀️' : '🌙'}
             </button>
@@ -616,6 +622,7 @@ function App() {
               onClick={() => setShowSettings(!showSettings)}
               className="settings-button"
               title="Settings"
+              aria-label="Settings"
             >
               ⚙️
             </button>
