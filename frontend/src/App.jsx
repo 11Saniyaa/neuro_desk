@@ -155,9 +155,9 @@ function App() {
     URL.revokeObjectURL(url)
   }, [data, sessionDuration, formatDuration])
 
-  // Debug: Log when data changes
+  // Debug: Log when data changes (only in development)
   useEffect(() => {
-    if (data) {
+    if (data && process.env.NODE_ENV === 'development') {
       console.log('📊 Data state updated:', {
         hasProductivity: !!data.productivity,
         hasPosture: !!data.posture,
