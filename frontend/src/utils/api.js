@@ -1,5 +1,9 @@
 /**
  * API utility with timeout, retry logic, and better error handling
+ * 
+ * @module utils/api
+ * @description Provides robust HTTP request utilities with automatic retry,
+ * timeout handling, and exponential backoff for the Neuro Desk application.
  */
 
 const DEFAULT_TIMEOUT = 10000; // 10 seconds
