@@ -153,7 +153,7 @@ function App() {
     a.download = `neuro_desk_${new Date().toISOString().split('T')[0]}.csv`
     a.click()
     URL.revokeObjectURL(url)
-  }, [data, sessionDuration])
+  }, [data, sessionDuration, formatDuration])
 
   // Debug: Log when data changes
   useEffect(() => {
@@ -550,7 +550,7 @@ function App() {
       setIsConnected(false)
       setIsAnalyzing(false)
     }
-  }, [])
+  }, [connectWebSocket])
 
   const stopCamera = useCallback(() => {
     if (streamRef.current) {
@@ -581,7 +581,7 @@ function App() {
   }, [])
 
   const getStatusIcon = React.useCallback((status) => {
-    if (status === 'high' || status === 'low' && status !== 'low') return '✅'
+    if (status === 'high' || status === 'low') return '✅'
     if (status === 'medium') return '⚠️'
     return '❌'
   }, [])
